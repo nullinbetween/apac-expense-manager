@@ -1,16 +1,16 @@
 """
-APAC Expense Manager — Multi-Agent System (v7.2)
+APAC Expense Manager — Multi-Agent System (v7.3)
 Primary agent + 3 sub-agents for household expense management across Asia-Pacific.
 
 v7.3 changes:
   - Added expense_id (UUID) for unique record identification
   - delete_expense now uses ID instead of composite key (date+country+store+amount+currency)
-  - query_expenses returns ID for each record
-  - save_expense auto-generates UUID via GENERATE_UUID()
+  - delete_expense simplified to single id parameter
+
 v7.2 changes:
   - Country list centralized (APAC_COUNTRIES/CURRENCIES/CATEGORIES variables)
   - Non-APAC countries accepted (global travel support: ZA, US, GB, etc.)
-  - Store query parameter added (LIKE fuzzy match)
+  - Store query parameter added (LIKE pattern match)
   - VN/KH/MM added to APAC country + currency + exchange rate lists
 v7.1 changes:
   - Language landing page strengthened (CRITICAL MANDATORY at top of root_agent)
