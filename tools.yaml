@@ -9,7 +9,7 @@ tools:
     source: expense-bq
     description: "Query APAC household expense records. Returns expenses filtered by country, category, store name, and/or date range."
     statement: |
-      SELECT * FROM `my-project-2026-hackthon.expense_data.expenses`
+      SELECT id, date, country, category, amount, currency, store, subcategory, notes FROM `my-project-2026-hackthon.expense_data.expenses`
       WHERE (@country = '' OR country = @country)
       AND (@category = '' OR category = @category)
       AND (@store = '' OR LOWER(store) LIKE CONCAT('%', LOWER(@store), '%'))
@@ -20,7 +20,7 @@ tools:
     parameters:
       - name: country
         type: string
-        description: "APAC country code: JP, HK, SG, TW, TH, KR, MY, AU, IN, PH. Empty string for all countries."
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.). Empty string for all countries."
       - name: category
         type: string
         description: "Expense category in Japanese: 食費, 交通, 日用品, 子供関連, サブスク, 住居・光熱費, 医療, 娯楽, 衣服・美容, その他. Empty string for all."
@@ -49,7 +49,7 @@ tools:
     parameters:
       - name: country
         type: string
-        description: "APAC country code: JP, HK, SG, TW, TH, KR, MY, AU, IN, PH. Empty string for all."
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.). Empty string for all."
       - name: date_from
         type: string
         description: "Start date in YYYY-MM-DD format (e.g., '2026-03-01'). Empty string for no lower bound."
@@ -63,13 +63,13 @@ tools:
     description: "Save a new categorized expense record to BigQuery. Used after categorizing a free-text expense."
     statement: |
       INSERT INTO `my-project-2026-hackthon.expense_data.expenses`
-      (date, country, category, amount, currency, store, subcategory, notes)
+      (id, date, country, category, amount, currency, store, subcategory, notes)
       VALUES
-      (CURRENT_DATE('Asia/Tokyo'), @country, @category, CAST(@amount AS FLOAT64), @currency, @store, @subcategory, @notes)
+      (GENERATE_UUID(), CURRENT_DATE('Asia/Tokyo'), @country, @category, CAST(@amount AS FLOAT64), @currency, @store, @subcategory, @notes)
     parameters:
       - name: country
         type: string
-        description: "APAC country code: JP, HK, SG, TW, TH, KR, MY, AU, IN, PH"
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.)"
       - name: category
         type: string
         description: "Expense category in Japanese: 食費, 交通, 日用品, 子供関連, サブスク, 住居・光熱費, 医療, 娯楽, 衣服・美容, その他"
@@ -92,27 +92,11 @@ tools:
   delete_expense:
     kind: bigquery-sql
     source: expense-bq
-    description: "Delete an expense record from BigQuery. Matches by date, country, store, amount, and currency to identify the record. Use with caution — always confirm with user before calling."
+    description: "Delete an expense record from BigQuery by its unique ID. Always query first to get the record ID, show details to user, and confirm before deleting."
     statement: |
       DELETE FROM `my-project-2026-hackthon.expense_data.expenses`
-      WHERE date = CAST(@date AS DATE)
-      AND country = @country
-      AND store = @store
-      AND amount = CAST(@amount AS FLOAT64)
-      AND currency = @currency
+      WHERE id = @id
     parameters:
-      - name: date
+      - name: id
         type: string
-        description: "Date of the expense in YYYY-MM-DD format (e.g., '2026-04-05')."
-      - name: country
-        type: string
-        description: "APAC country code: JP, HK, SG, TW, TH, KR, MY, AU, IN, PH"
-      - name: store
-        type: string
-        description: "Store or service name to match (e.g., Starbucks)"
-      - name: amount
-        type: string
-        description: "Expense amount as a string (e.g., '550'). Must match exactly."
-      - name: currency
-        type: string
-        description: "Currency code: JPY, HKD, SGD, TWD, THB, KRW, MYR, AUD, INR, PHP, USD"
+        description: "The unique ID (UUID) of the expense record to delete. Get this from query_expenses results first."

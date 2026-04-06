@@ -2,10 +2,21 @@
 APAC Expense Manager — Multi-Agent System (v7.2)
 Primary agent + 3 sub-agents for household expense management across Asia-Pacific.
 
+v7.3 changes:
+  - Added expense_id (UUID) for unique record identification
+  - delete_expense now uses ID instead of composite key (date+country+store+amount+currency)
+  - query_expenses returns ID for each record
+  - save_expense auto-generates UUID via GENERATE_UUID()
+v7.2 changes:
+  - Country list centralized (APAC_COUNTRIES/CURRENCIES/CATEGORIES variables)
+  - Non-APAC countries accepted (global travel support: ZA, US, GB, etc.)
+  - Store query parameter added (LIKE fuzzy match)
+  - VN/KH/MM added to APAC country + currency + exchange rate lists
+v7.1 changes:
+  - Language landing page strengthened (CRITICAL MANDATORY at top of root_agent)
 v7 changes:
   - Cross-currency conversion: infer primary currency from data + fixed demo exchange rates
   - Shows breakdown by original currency + approximate total in primary currency
-
 v6.1 changes:
   - Dynamic date injection (fixes Gemini writing Python code)
 v6 changes:
@@ -250,7 +261,7 @@ expense_query = Agent(
 - query_expenses: Search expenses by country, category, store name, and/or date range. Parameters: country (string), category (string), store (string, partial match, case-insensitive), date_from (string, YYYY-MM-DD), date_to (string, YYYY-MM-DD). Use empty string "" for any parameter to skip that filter.
 - get_spending_summary: Get totals grouped by country and category, with optional date range. Parameters: country (string), date_from (string), date_to (string). Use "" for all.
 - save_expense: Save a new expense record.
-- delete_expense: Delete an expense record by date, country, store, amount, and currency.
+- delete_expense: Delete an expense record by its unique ID. Always query first to get the ID.
 
 {DATE_CONTEXT}
 
@@ -262,9 +273,9 @@ expense_query = Agent(
 - No date mentioned → use empty strings "" (all dates)
 
 **Delete handling:**
-- When user asks to delete an expense, FIRST use query_expenses to find and show the matching record(s)
-- Show the user what will be deleted and ask for confirmation
-- Only call delete_expense AFTER the user confirms
+- When user asks to delete an expense, FIRST use query_expenses to find and show the matching record(s) — the results include each record's unique ID
+- Show the user the matching records and ask which one to delete
+- Only call delete_expense with the record's ID AFTER the user confirms
 - Never delete without showing the user what will be deleted first
 
 **Response rules:**
@@ -280,7 +291,7 @@ expense_query = Agent(
 - "Show all food expenses" → query_expenses with category=食費
 - "Show my Starbucks expenses" → query_expenses with store=Starbucks
 - "3月の支出は？" → get_spending_summary with date_from=2026-03-01, date_to=2026-03-31
-- "Delete the Starbucks 550 yen" → query_expenses to find it first, then confirm, then delete_expense
+- "Delete the Starbucks 550 yen" → query_expenses to find it first → show record with ID → user confirms → delete_expense with id
 """,
     tools=[query_toolset],
     after_model_callback=language_callback,
