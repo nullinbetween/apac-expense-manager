@@ -1,0 +1,10 @@
+[project]
+name = "apac_expense_manager"
+version = "1.0.0"
+description = "Multi-agent APAC household expense management system"
+requires-python = ">=3.10"
+dependencies = [
+    "google-adk",
+    "google-auth",
+    "opencc-python-reimplemented",
+]

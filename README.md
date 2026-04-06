@@ -1,0 +1,127 @@
+# APAC Expense Manager
+
+> An AI-powered multilingual, multi-currency household expense manager for APAC families living across borders.
+
+Built for the **Google Cloud x Hack2skill Gen AI Academy APAC Edition** hackathon.
+
+<!-- TODO: Add screenshot or GIF of a conversation here -->
+<!-- ![Demo](docs/demo.gif) -->
+
+## The Problem
+
+APAC families living across borders face a unique challenge: expenses span multiple countries, currencies, and languages — all within the same household. Existing expense trackers assume a single-country, single-currency lifestyle. For a working parent who commutes between Tokyo and Hong Kong, sends their child to school in Japan, and visits family in Taiwan, no simple tool exists to manage it all in one place.
+
+## The Solution
+
+APAC Expense Manager is a conversational expense tracker that understands the multilingual, multi-currency reality of APAC families.
+
+**Talk to it in Traditional Chinese, Simplified Chinese, English, Japanese, or Korean. It handles the rest.**
+
+### Key Capabilities
+
+- **Natural language expense tracking**: Just say "bought coffee at Starbucks 550 yen" — the agent categorizes, converts, and saves to BigQuery automatically
+- **5-language support**: Traditional Chinese, Simplified Chinese, English, Japanese, Korean — with OpenCC for accurate Traditional/Simplified Chinese conversion
+- **Multi-currency intelligence**: Records expenses in local currency, converts to a primary currency (JPY) for cross-country summaries with exchange rate context
+- **Context-aware financial guidance**: Ask "if I cancel this subscription, how much do I save per year?" or "my friend is getting married, what's the gift standard?" and get actionable advice based on your actual spending data
+- **Emergent multi-tool reasoning**: The agent combines existing tools (e.g., delete + save) to handle record modification — without a dedicated "modify" tool. This behavior emerged from Gemini's reasoning over the available tool set
+
+## Architecture
+
+```
+User (ADK Web UI)
+  ↓
+Primary Agent (apac_expense_manager) — Gemini 2.5 Flash on Vertex AI
+  ├── expense_categorizer  → Categorize + save to BigQuery via MCP Toolbox
+  ├── expense_query        → Query / delete records (date, category, country, store)
+  └── expense_reporter     → Spending analysis with cross-currency conversion
+```
+
+### Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Framework | Google ADK (Agent Development Kit) |
+| Model | Gemini 2.5 Flash (Vertex AI) |
+| Database | BigQuery (via MCP Toolbox for Databases) |
+| Deployment | Cloud Run (europe-west1) |
+| Config | Secret Manager (tools.yaml) |
+| Language Processing | OpenCC (Traditional ↔ Simplified Chinese) |
+
+**Why Google Cloud?** Vertex AI provides managed Gemini access with no model hosting overhead. Cloud Run enables serverless deployment with zero cold-start configuration. Secret Manager handles tools.yaml versioning (10 versions tracked) with safe rollback capability. BigQuery scales from demo to production without schema migration.
+
+## Project Structure
+
+```
+apac_expense_manager/
+├── apac_expense_manager/
+│   ├── __init__.py
+│   └── agent.py          # Main agent code (v7.2)
+├── tools.yaml             # MCP Toolbox SQL configuration
+├── Dockerfile
+├── pyproject.toml
+├── seed_demo_data.sh      # Demo data loader (66 records, 6 countries)
+├── seed_demo_data.sql      # Same data in SQL format
+├── DEPLOY_GUIDE.md        # Step-by-step deployment instructions
+└── README.md
+```
+
+## Deployment
+
+### Prerequisites
+
+- Google Cloud project with billing enabled
+- BigQuery dataset (`expense_data.expenses`)
+- Secret Manager secret for `tools.yaml`
+- Cloud Run services for both the agent and MCP Toolbox
+
+### Quick Deploy
+
+> **Note**: This deployment guide is simplified for demo/hackathon purposes. For production use, pin image versions and configure authentication.
+
+```bash
+# Set environment
+export PROJECT_ID="your-project-id"
+export REGION="europe-west1"
+export TOOLBOX_URL="https://your-toolbox-url.run.app"
+
+# Deploy MCP Toolbox (BigQuery connector)
+gcloud run deploy expense-toolbox \
+  --image us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest \
+  --region=$REGION --project=$PROJECT_ID \
+  --set-env-vars="TOOLBOX_CONFIG_SOURCE=secret:expense-tools" \
+  --allow-unauthenticated --port=8080
+
+# Deploy Agent
+cd apac_expense_manager
+gcloud run deploy apac-expense-manager --source . \
+  --project=$PROJECT_ID --region=$REGION \
+  --port=8000 --set-env-vars="TOOLBOX_URL=$TOOLBOX_URL" \
+  --allow-unauthenticated
+```
+
+See [DEPLOY_GUIDE.md](DEPLOY_GUIDE.md) for detailed instructions.
+
+## Demo Data
+
+Load 66 realistic expense records across 6 APAC countries (JP, HK, TW, SG, KR, TH) with a "Tokyo-based working single mom" persona:
+
+```bash
+bash seed_demo_data.sh
+```
+
+## Engineering Highlights
+
+- **Robust data handling**: `FLOAT64` vs `STRING` type casting in MCP Toolbox SQL, dynamic date injection to prevent Gemini from generating Python code
+- **Version-controlled config**: tools.yaml managed through Secret Manager (10 versions), enabling safe rollback
+- **Graceful language handling**: Language selection prompt shown first, but if skipped, agent auto-detects from input — never blocks the user
+- **APAC-first, globally aware**: Core support for 14 APAC countries/currencies, but accepts any ISO 3166 country code for travel/business trip scenarios
+
+## Lessons Learned
+
+- **Toolbox port change incident**: The `toolbox:latest` image silently changed its default port from 5000 to 8080, causing TCP startup probe failures. Lesson: pin image versions in production.
+- **Gemini writes Python instead of using tools**: When asked to "calculate today's date", Gemini generated Python code. Fixed by injecting dates at container startup.
+- **LLM as reasoning engine, not just CRUD**: Gemini combined delete + save tools to handle record modification without explicit instruction — demonstrating emergent tool composition.
+
+## License
+
+This project was built for the Google Cloud x Hack2skill Gen AI Academy APAC Edition hackathon.
