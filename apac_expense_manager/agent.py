@@ -122,7 +122,9 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 model_name = "gemini-2.5-flash"
-TOOLBOX_URL = os.environ.get("TOOLBOX_URL", "http://localhost:5000")
+TOOLBOX_URL = os.environ.get("TOOLBOX_URL")
+if not TOOLBOX_URL:
+    raise ValueError("TOOLBOX_URL environment variable is required")
 
 # ---------------------------------------------------------------------------
 # Language callback — intercepts model output and converts Chinese script
