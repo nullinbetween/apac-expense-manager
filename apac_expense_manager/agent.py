@@ -5,8 +5,8 @@ Primary agent + 3 sub-agents for household expense management across Asia-Pacifi
 v7.3 changes:
   - Added expense_id (UUID) for unique record identification
   - delete_expense now uses ID instead of composite key (date+country+store+amount+currency)
-  - delete_expense simplified to single id parameter
-
+  - query_expenses returns ID for each record
+  - save_expense auto-generates UUID via GENERATE_UUID()
 v7.2 changes:
   - Country list centralized (APAC_COUNTRIES/CURRENCIES/CATEGORIES variables)
   - Non-APAC countries accepted (global travel support: ZA, US, GB, etc.)
@@ -81,19 +81,18 @@ EXCHANGE_RATES_TO_JPY = {
 }
 
 FX_CONTEXT = f"""
-**Cross-currency conversion (demo rates, base = JPY):**
-When the user asks for a total across multiple currencies, follow these steps:
-1. First, show a breakdown by original currency (e.g., "¥12,000 JPY, HK$350 HKD, ₩45,000 KRW")
-2. Then convert each currency to JPY using these approximate rates:
-{chr(10).join(f'   - 1 {cur} ≈ {rate} JPY' for cur, rate in EXCHANGE_RATES_TO_JPY.items() if cur != 'JPY')}
-3. Show the approximate total in JPY: "≈ ¥XX,XXX JPY (approximate)"
-4. Add a disclaimer: "※ Demo exchange rates for reference only / デモ用参考レート"
+**Cross-currency conversion (demo rates):**
 
-**How to determine primary display currency:**
-- Look at which currency appears MOST in the query results
-- If the user lives in Japan (default assumption), use JPY
-- If the user explicitly mentions a base currency, use that instead
-- Always show original currencies first, then the converted total
+Available exchange rates (to JPY):
+{chr(10).join(f'   - 1 {cur} ≈ {rate} JPY' for cur, rate in EXCHANGE_RATES_TO_JPY.items() if cur != 'JPY')}
+
+**Display currency rules (strict priority order):**
+1. If the user explicitly requests a target currency (e.g., "in USD", "換算成港幣"), use that currency for all conversions.
+2. Otherwise, always show the original currency breakdown first.
+3. Then provide an approximate converted total in JPY as the default display currency for this demo.
+4. If the query is about a specific foreign trip or country, also show the local currency subtotal for context (e.g., "Total: ≈¥150,000 JPY (approx. HK$7,800)").
+5. Present converted totals as approximate with exchange-rate disclaimer.
+6. Do NOT claim JPY is the user's primary currency — it is the app's default display currency for convenience.
 
 **Example output format:**
 📊 Spending breakdown:
@@ -103,7 +102,7 @@ When the user asks for a total across multiple currencies, follow these steps:
 
 💰 Approximate total: ≈ ¥14,950 JPY
   (¥8,500 + HK$200 × 19.5 + ₩15,000 × 0.11)
-※ Demo exchange rates for reference only
+※ Demo exchange rates for reference only / デモ用参考レート
 """
 
 # ---------------------------------------------------------------------------
