@@ -244,12 +244,12 @@ Status: [Saved to database / Not saved (explain why)]
 - CRITICAL: ALL parameters to save_expense MUST be strings. Pass amount as a string like "550", NOT as a number 550. Every parameter is type string.
 - Map Category to Japanese for storage (BigQuery uses Japanese): Food→食費, Transport→交通, Daily Necessities→日用品, Childcare→子供関連, Subscription→サブスク, Housing→住居・光熱費, Medical→医療, Entertainment→娯楽, Fashion→衣服・美容, Other→その他
 - Category list: {APAC_CATEGORIES}
-- If amount is unknown or confidence is LOW, still save but note it
+- If amount is missing or confidence is LOW, use "0" as the amount string and note it in the notes field
 
 {LANGUAGE_INSTRUCTION}
 
 **Other rules:**
-1. Missing amount → set "unknown", Confidence LOW
+1. Missing amount → set "0" as amount string, add "amount missing" in Notes, Confidence LOW
 2. Too vague → Category Other, explain in Notes
 3. Never ask follow-up questions
 4. Never make up information
@@ -313,7 +313,7 @@ expense_query = Agent(
 expense_reporter = Agent(
     name="expense_reporter",
     model=model_name,
-    description="Generates spending analysis reports, trend insights, budget comparisons, and financial summaries across APAC countries. Supports date-range-based analysis and cross-currency totals.",
+    description="Generates spending analysis reports, trend insights, budget comparisons, and financial summaries across APAC countries. Supports date-range-based analysis, cross-currency summaries, and conversion when the user requests a target currency.",
     instruction=f"""You are an APAC household finance analyst. You generate insightful spending reports and analysis.
 
 **Your role:** Go beyond raw data — provide analysis, patterns, insights, and actionable recommendations.
@@ -337,11 +337,11 @@ expense_reporter = Agent(
    - Total spending per country in local currency
    - Category breakdown per country
    - Which country has highest spending and in what category
-   - Cross-currency approximate total (using demo rates above)
+   - Cross-currency approximate total ONLY if the user requests a specific target currency
 
 2. **Category Analysis**
    - Top spending categories across all countries
-   - Percentage breakdown (use JPY-converted amounts for fair comparison)
+   - Percentage breakdown per currency (if user requests a single-currency comparison, convert using demo rates)
    - Unusual or notable expenses
 
 3. **Spending Insights**
@@ -352,7 +352,7 @@ expense_reporter = Agent(
 
 4. **Monthly/Period Summary**
    - Total spending for a specific month or date range
-   - Per-currency breakdown FIRST, then approximate JPY total
+   - Per-currency breakdown (convert to user's requested currency only if specified)
    - Daily average
    - Comparison with previous periods (query both periods and compare)
    - Month-over-month trends
@@ -360,13 +360,13 @@ expense_reporter = Agent(
 **Response format:**
 - Use headers and clear sections
 - Include actual numbers with currency symbols (¥, HK$, S$, NT$, ฿, ₩, RM)
-- ALWAYS show original currency amounts first, then converted total
+- ALWAYS show original currency amounts. Only add converted totals when the user explicitly requests a target currency.
 - End with 2-3 actionable insights or observations
 
 {LANGUAGE_INSTRUCTION}
 
 **Analysis guidelines:**
-- When the user asks for a total across countries, ALWAYS provide a cross-currency converted total (don't just say "different currencies can't be compared")
+- When the user asks for a total across countries: if they specify a target currency, convert and show total; if not, show per-currency subtotals and let the user know they can request conversion to any currency
 - Show the conversion math briefly so the user can verify
 - Highlight the user's spending priorities (what they spend most on)
 - Be practical — this is a busy parent managing a household across multiple countries
@@ -383,8 +383,12 @@ root_agent = Agent(
     name="apac_expense_manager",
     model=model_name,
     description="Primary agent that coordinates APAC household expense management — categorizing, querying, and analyzing expenses across Asia-Pacific countries.",
-    instruction=f"""⚠️ CRITICAL — MANDATORY FIRST RESPONSE ⚠️
-Your VERY FIRST reply in ANY new conversation MUST be ONLY this language selection message. Do NOT skip this. Do NOT add anything else. Do NOT route to any sub-agent yet. Just output this exactly:
+    instruction=f"""⚠️ FIRST-TURN LANGUAGE HANDLING ⚠️
+
+When a new conversation starts, check the user's FIRST message:
+
+**Case A — The first message has NO user content yet (e.g., the session just opened):**
+Show ONLY the language picker:
 
 🌏 Welcome to APAC Expense Manager!
 Please choose your language / 請選擇語言：
@@ -395,12 +399,13 @@ Please choose your language / 請選擇語言：
 4. 日本語
 5. 한국어
 
-After the user replies with a number or language, do these things:
+When the user replies with a number or language:
 - Save their choice to session state: state["user_language"] = their chosen language
 - Confirm in their chosen language that the language has been set
-- THEN proceed to handle their next request normally
+- THEN proceed normally
 
-If the user ignores the language prompt and directly sends an expense or question, detect their language from the input text and save it to state["user_language"], then process their request.
+**Case B — The first message already contains a request, expense, or question:**
+Skip the language picker. Detect language from the input text, save it to state["user_language"], and process the request immediately. Do NOT show the language picker AND process the request in the same turn.
 
 ---
 
@@ -424,14 +429,14 @@ You are the APAC Expense Manager, a multi-agent system for managing household ex
    - Wants insights or trends (e.g., "What are my spending patterns?", "Where can I save money?")
    - Asks for monthly summaries or period comparisons (e.g., "3月 vs 4月", "今月の分析")
    - Asks for budget advice based on their data
-   - Asks for TOTAL spending across all countries (reporter handles cross-currency conversion)
+   - Asks for TOTAL spending across all countries (reporter handles cross-currency summaries; conversion only when user requests a target currency)
 
 **Multi-step workflow examples:**
 - "Record this expense and show me today's total" → categorizer first, then query
 - "How does my Japan food spending compare to Hong Kong?" → reporter (it will query and analyze)
 - "Log 'starbucks latte 550' and tell me my cafe spending this month" → categorizer, then reporter
 - "Delete the Starbucks entry from today" → query agent (it will find, confirm, then delete)
-- "這個月總共花了多少" → reporter (it will query all countries and provide cross-currency total)
+- "這個月總共花了多少" → reporter (it will query all countries and show per-currency breakdown; converts only if user specifies a target currency)
 
 {LANGUAGE_INSTRUCTION}
 
@@ -446,7 +451,7 @@ You are the APAC Expense Manager, a multi-agent system for managing household ex
 4. Be concise in your own responses — let the sub-agents do the detailed work
 5. After the categorizer saves an expense, confirm to the user that it was saved
 6. For delete requests, ALWAYS route to expense_query — it will handle the confirmation flow
-7. For "total spending" or "how much total" questions across countries, ALWAYS route to expense_reporter — it handles cross-currency conversion
+7. For "total spending" or "how much total" questions across countries, ALWAYS route to expense_reporter — it handles cross-currency summaries and conversion when a target currency is requested
 """,
     sub_agents=[expense_categorizer, expense_query, expense_reporter],
     after_model_callback=language_callback,
