@@ -4,9 +4,6 @@
 
 Built for the **Google Cloud x Hack2skill Gen AI Academy APAC Edition** hackathon.
 
-<!-- TODO: Add screenshot or GIF of a conversation here -->
-<!-- ![Demo](docs/demo.gif) -->
-
 ## The Problem
 
 APAC families living across borders face a unique challenge: expenses span multiple countries, currencies, and languages — all within the same household. Existing expense trackers assume a single-country, single-currency lifestyle. For a working parent who commutes between Tokyo and Hong Kong, sends their child to school in Japan, and visits family in Taiwan, no simple tool exists to manage it all in one place.
@@ -19,11 +16,12 @@ APAC Expense Manager is a conversational expense tracker that understands the mu
 
 ### Key Capabilities
 
-- **Natural language expense tracking**: Just say "bought coffee at Starbucks 550 yen" — the agent categorizes, converts, and saves to BigQuery automatically
-- **5-language support**: Traditional Chinese, Simplified Chinese, English, Japanese, Korean — with OpenCC for accurate Traditional/Simplified Chinese conversion
-- **Multi-currency intelligence**: Records expenses in local currency, converts to a primary currency (JPY) for cross-country summaries with exchange rate context
-- **Context-aware financial guidance**: Ask "if I cancel this subscription, how much do I save per year?" or "my friend is getting married, what's the gift standard?" and get actionable advice based on your actual spending data
-- **Emergent multi-tool reasoning**: The agent combines existing tools (e.g., delete + save) to handle record modification — without a dedicated "modify" tool. This behavior emerged from Gemini's reasoning over the available tool set
+- **Natural language expense tracking**: Say "スタバ ラテ 550円" — the agent auto-detects Japan, categorizes under Food, and saves to BigQuery. Responses are natural language confirmations, not database output.
+- **5-language support**: Traditional Chinese, Simplified Chinese, English, Japanese, Korean — with OpenCC for accurate Traditional/Simplified Chinese conversion. Language detected automatically from input if user skips onboarding.
+- **Multi-currency intelligence**: Records in local currency. Cross-country summaries show original currency breakdown per country. Users can request conversion to any supported currency for approximate totals. 14 APAC currencies + global travel support.
+- **Conversation context**: The agent maintains context across turns. Say "Starbucks latte" (missing amount) → agent recognizes but doesn't save → reply just "100yen" → agent recalls the prior context and saves with full details. No need to repeat store, country, or category.
+- **Context-aware financial guidance**: Ask "if I cancel Netflix, how much do I save per year?" — the agent finds the monthly charge in BigQuery, calculates ¥23,760/year, and gives actionable savings suggestions based on real spending data.
+- **Emergent multi-tool reasoning**: No "modify" tool exists. When asked to change an expense, the agent reasons through: query → confirm with user → delete old → save new → report as single update. This behavior emerged from Gemini's reasoning, not hardcoded logic.
 
 ## Architecture
 
@@ -32,22 +30,20 @@ User (ADK Web UI)
   ↓
 Primary Agent (apac_expense_manager) — Gemini 2.5 Flash on Vertex AI
   ├── expense_categorizer  → Categorize + save to BigQuery via MCP Toolbox
-  ├── expense_query        → Query / delete records (date, category, country, store)
-  └── expense_reporter     → Spending analysis with cross-currency conversion
+  ├── expense_query        → Query / delete / modify records (date, category, country, store)
+  └── expense_reporter     → Spending analysis with cross-currency conversion + financial guidance
 ```
 
 ### Tech Stack
 
-| Component | Technology |
-|-----------|-----------|
-| Framework | Google ADK (Agent Development Kit) |
-| Model | Gemini 2.5 Flash (Vertex AI) |
-| Database | BigQuery (via MCP Toolbox for Databases) |
-| Deployment | Cloud Run (europe-west1) |
-| Config | Secret Manager (tools.yaml) |
-| Language Processing | OpenCC (Traditional ↔ Simplified Chinese) |
-
-**Why Google Cloud?** Vertex AI provides managed Gemini access with no model hosting overhead. Cloud Run enables serverless deployment with zero cold-start configuration. Secret Manager handles tools.yaml versioning (11 versions tracked) with safe rollback capability. BigQuery scales from demo to production without schema migration.
+| Component | Technology | Why |
+|-----------|-----------|-----|
+| Framework | Google ADK (Agent Development Kit) | Multi-agent orchestration with sub-100ms tool routing |
+| Model | Gemini 2.5 Flash (Vertex AI) | Best cost-performance ratio for multilingual + reasoning tasks |
+| Database | BigQuery (via MCP Toolbox for Databases) | Scales from demo to production; SQL tools defined in YAML, no code changes needed |
+| Deployment | Cloud Run (europe-west1) | Serverless, zero cold-start config, auto-scaling |
+| Config | Secret Manager (tools.yaml, 11 versions) | Safe rollback capability for SQL tool definitions |
+| Language Processing | OpenCC | Accurate Traditional ↔ Simplified Chinese conversion in `after_model_callback` |
 
 ## Project Structure
 
@@ -55,8 +51,8 @@ Primary Agent (apac_expense_manager) — Gemini 2.5 Flash on Vertex AI
 apac_expense_manager/
 ├── apac_expense_manager/
 │   ├── __init__.py
-│   └── agent.py          # Main agent code (v7.3)
-├── tools.yaml             # MCP Toolbox SQL configuration
+│   └── agent.py          # Main agent code (v7.6)
+├── tools.yaml             # MCP Toolbox SQL configuration (4 tools: save, query, delete, summary)
 ├── Dockerfile
 ├── pyproject.toml
 ├── seed_demo_data.sh      # Demo data loader (66 records, 6 countries)
@@ -75,8 +71,6 @@ apac_expense_manager/
 - Cloud Run services for both the agent and MCP Toolbox
 
 ### Quick Deploy
-
-> **Note**: This deployment guide is simplified for demo/hackathon purposes. For production use, pin image versions and configure authentication.
 
 ```bash
 # Set environment
@@ -111,18 +105,32 @@ bash seed_demo_data.sh
 
 ## Engineering Highlights
 
-- **UUID-based record identification**: Each expense has a unique `id` generated by `GENERATE_UUID()`. Enables reliable single-record deletion instead of fragile composite key matching
-- **Robust data handling**: `FLOAT64` vs `STRING` type casting in MCP Toolbox SQL, dynamic date injection to prevent Gemini from generating Python code
-- **Version-controlled config**: tools.yaml managed through Secret Manager (11 versions), enabling safe rollback
-- **Graceful language handling**: Language selection prompt shown first, but if skipped, agent auto-detects from input — never blocks the user
-- **APAC-first, globally aware**: Core support for 14 APAC countries/currencies, but accepts any ISO 3166 country code for travel/business trip scenarios
+- **Emergent modify = query + confirm + delete + save**: The agent decomposes "change Starbucks from ¥550 to ¥500" into four steps using only three base tools — demonstrating LLM reasoning beyond CRUD
+- **Product-grade UX from prompt engineering alone**: User-facing output uses natural language ("已記錄 Starbucks ¥550（日本／食費）"), internal reasoning (country detection, confidence scoring) stays hidden. No ID/UUID ever shown to users.
+- **Conversation context across turns**: Missing information (e.g., amount) triggers a clarify-first flow; user's follow-up with just the amount is understood in context without re-stating store/country/category
+- **UUID-based record identification**: Each expense has a unique `id` via `GENERATE_UUID()`. Enables reliable single-record operations instead of fragile composite key matching
+- **Dynamic date injection**: Dates injected at container startup to prevent Gemini from generating Python code when asked about "today" or "this month"
+- **Graceful language handling**: Language selection shown at session start; if skipped, agent auto-detects from input — never blocks the user
+- **APAC-first, globally aware**: Core support for 14 APAC countries/currencies, but accepts any ISO 3166 country code for travel scenarios
+
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| v7.6 | Modify/delete UX polish — product voice, hide ID/UUID, minimum necessary info for confirmations |
+| v7.5 | User-facing output rewrite — natural language confirmations, no debug fields, missing amount clarify-first |
+| v7.4 | Currency display overhaul — breakdown-only by default, conversion only on request. First-turn language flow fix |
+| v7.3 | UUID primary key for all records. Reliable single-record delete |
+| v7.2 | Global country code support. Store name search (fuzzy match) |
+| v7.0 | Cross-currency conversion with fixed APAC exchange rates |
+| v6.0 | Language onboarding + OpenCC + date range query + delete function |
 
 ## Lessons Learned
 
-- **Toolbox port change incident**: The `toolbox:latest` image silently changed its default port from 5000 to 8080, causing TCP startup probe failures. Lesson: pin image versions in production.
-- **Gemini writes Python instead of using tools**: When asked to "calculate today's date", Gemini generated Python code. Fixed by injecting dates at container startup.
-- **LLM as reasoning engine, not just CRUD**: Gemini combined delete + save tools to handle record modification without explicit instruction — demonstrating emergent tool composition.
-- **Proper data integrity from day one**: Added UUID primary key to BigQuery schema and backfilled existing records, ensuring reliable record operations as data scales.
+- **LLM as reasoning engine, not CRUD wrapper**: The most impressive demo moment — emergent modify — was never coded. Good agent architecture gives the model room to reason.
+- **Separate internal reasoning from user output**: Early versions showed debug fields (Country: JP, Category: Food, Confidence: HIGH) to users. Splitting prompt into "internal reasoning" vs "user-facing output" sections solved this cleanly.
+- **Pin your infrastructure versions**: The `toolbox:latest` image silently changed its default port from 5000 to 8080, causing startup failures. Lesson learned the hard way.
+- **Prompt engineering is product design**: Every v7.x release was a prompt-only change. No architecture changes, no new tools — just better instructions producing better user experience.
 
 ## License
 
