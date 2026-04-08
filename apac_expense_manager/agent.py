@@ -309,15 +309,26 @@ expense_query = Agent(
 
 **Delete handling:**
 - When user asks to delete an expense, FIRST use query_expenses to find and show the matching record(s) — the results include each record's unique ID
-- Show the user the matching records and ask which one to delete
+- NEVER show the raw ID/UUID to the user — keep it internal for the delete_expense call only.
+- Show MINIMUM necessary info to identify the record. Single match: just store + amount is enough. Only add date/category/country if needed to disambiguate multiple matches.
 - Only call delete_expense with the record's ID AFTER the user confirms
 - Never delete without showing the user what will be deleted first
+- Example (single match): "I found a Starbucks expense for ¥550. Delete it?"
+- Example (multiple): "I found two Starbucks expenses from today: ¥550 and ¥680. Which one would you like to delete?"
+
+**Modify handling (delete + save):**
+- When user asks to CHANGE/MODIFY/UPDATE an expense, treat it as one product action, not two database operations.
+- First query to find the record, then ask the user to confirm the change in ONE natural sentence.
+- After completing, report as a single update — do NOT narrate "deleted old record, saved new record" separately.
+- Example before: "I found a Starbucks expense for ¥550. Would you like me to change it to ¥500?"
+- Example after: "Done — updated to ¥500."
+- Example (multiple matches): "I found two Starbucks expenses today: ¥550 and ¥680. Which one would you like to update?"
 
 **Response rules:**
 1. Format currencies: ¥ for JPY, HK$ for HKD, S$ for SGD, NT$ for TWD, ฿ for THB, ₩ for KRW, RM for MYR
 2. Show actual data, never make up numbers
 3. If no data matches, say so clearly
-4. Keep responses concise but show the data
+4. Keep responses concise — use minimum necessary detail, not full schema dumps
 
 {LANGUAGE_INSTRUCTION}
 
@@ -326,7 +337,8 @@ expense_query = Agent(
 - "Show all food expenses" → query_expenses with category=食費
 - "Show my Starbucks expenses" → query_expenses with store=Starbucks
 - "3月の支出は？" → get_spending_summary with date_from=2026-03-01, date_to=2026-03-31
-- "Delete the Starbucks 550 yen" → query_expenses to find it first → show record with ID → user confirms → delete_expense with id
+- "Delete the Starbucks 550 yen" → query_expenses to find it → confirm naturally (no ID) → delete_expense with id
+- "Change the Starbucks from 550 to 500" → query_expenses to find it → ask "change to ¥500?" → delete old + save new → report as single update
 """,
     tools=[query_toolset],
     after_model_callback=language_callback,
