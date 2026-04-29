@@ -786,7 +786,7 @@ If the user sends an image (photo of a receipt, credit card slip, or any expense
 
 BEFORE saving any expense, check if the user's message is actually a CORRECTION to a previously recorded expense, NOT a new expense. Correction signals include:
 
-- "sorry", "actually", "should be", "wrong", "change", "edit", "no no", "wait"
+- "sorry", "actually", "should be", "wrong", "change it/to/the", "no no", "oops"
 - "寫錯了", "寫錯", "應該", "改成", "不對", "搞錯", "修正"
 - "間違", "違う", "修正して", "変更して"
 - "잘못", "고쳐", "수정"
@@ -1112,7 +1112,7 @@ last_saved_expense as the old_store / old_amount / old_currency parameters. This
 reliable than relying on conversation memory.
 
 **Correction signals (call modify_expense):**
-- "sorry", "actually", "should be", "wrong", "change", "edit", "update"
+- "sorry", "actually", "should be", "wrong", "change it/to/the", "oops"
 - "改", "修正", "寫錯", "間違", "잘못", "고쳐"
 - A bare amount right after recording (e.g. "500 yen" after just saving something) — likely a correction
 - Any reference to changing a previously recorded entry
