@@ -6,7 +6,7 @@ Built for the **Google Cloud x Hack2skill Gen AI Academy APAC Edition** hackatho
 
 ## Why This Matters
 
-APAC families living across borders deal with expenses in multiple countries, currencies, and languages — all within the same household. A working parent commuting between Tokyo and Hong Kong, sending their child to school in Japan, visiting family in Taiwan.
+APAC families living across borders deal with expenses in multiple countries, currencies, and languages — all within the same household. A working parent might commute between Tokyo and Hong Kong, send their child to school in Japan, and visit family in Taiwan — all while tracking expenses across languages and currencies.
 
 The real problem is not calculation — it is intake friction. Busy parents don't have time to open spreadsheets, normalize currencies, translate receipts, or fix mistakes manually.
 
@@ -21,7 +21,7 @@ APAC Expense Manager eliminates that friction. Talk to it. Send it a receipt pho
 ## Key Capabilities
 
 - **Natural language expense tracking**: Say "スタバ ラテ 550円" — the agent auto-detects Japan, categorizes under Food, and saves to BigQuery. Works in Traditional Chinese, Simplified Chinese, English, Japanese, and Korean.
-- **Receipt recognition**: Snap a photo of any APAC receipt — Thai, Japanese, Hong Kong — the agent extracts store, amount, currency, and country automatically. Supports multi-slip photos and tax-inclusive amount detection.
+- **Receipt recognition**: Snap a photo of an APAC receipt — Thai, Japanese, Hong Kong — the agent extracts store, amount, currency, and country automatically. Supports multi-slip photos and tax-inclusive amount detection.
 - **Intelligent correction**: Say "sorry it should be 500 yen" right after recording. The system detects the correction at the Python layer, intercepts before the model can misinterpret it, and routes to modify automatically. One step, no follow-up needed.
 - **Multi-currency intelligence**: Records in local currency. Summaries show original currency breakdown per country. Conversion to any supported currency on request. 14 APAC currencies + global travel support.
 - **Conversation context**: Say "Starbucks latte" (missing amount) → agent recognizes but doesn't save → reply "100yen" → agent recalls context and saves with full details. No need to repeat anything.
