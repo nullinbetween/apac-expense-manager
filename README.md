@@ -1,49 +1,80 @@
 # APAC Expense Manager
 
-> An AI-powered multilingual, multi-currency household expense manager for APAC families living across borders.
+A multilingual, multi-currency AI financial intake layer for cross-border APAC households — turning messy daily expenses, receipts, corrections, and reimbursements into structured BigQuery data.
 
-Built for the **Google Cloud x Hack2skill Gen AI Academy APAC Edition** hackathon.
+Built for the **Google Cloud x Hack2skill Gen AI Academy APAC Edition** hackathon. Selected for **Top 100 Refinement Phase**.
 
-## The Problem
+## Why This Matters
 
-APAC families living across borders face a unique challenge: expenses span multiple countries, currencies, and languages — all within the same household. Existing expense trackers assume a single-country, single-currency lifestyle. For a working parent who commutes between Tokyo and Hong Kong, sends their child to school in Japan, and visits family in Taiwan, no simple tool exists to manage it all in one place.
+APAC families living across borders deal with expenses in multiple countries, currencies, and languages — all within the same household. A working parent commuting between Tokyo and Hong Kong, sending their child to school in Japan, visiting family in Taiwan.
 
-## The Solution
+The real problem is not calculation — it is intake friction. Busy parents don't have time to open spreadsheets, normalize currencies, translate receipts, or fix mistakes manually.
 
-APAC Expense Manager is a conversational expense tracker that understands the multilingual, multi-currency reality of APAC families.
+APAC Expense Manager eliminates that friction. Talk to it. Send it a receipt photo. Correct a mistake in natural language. It handles the rest — in five languages, across 14+ APAC currencies, backed by BigQuery.
 
-**Talk to it in Traditional Chinese, Simplified Chinese, English, Japanese, or Korean. It handles the rest.**
+## Demo & Links
 
-### Key Capabilities
+- **Live deployment**: [Cloud Run (europe-west1)](https://apac-expense-manager-175546014414.europe-west1.run.app)
+- **Demo video**: *(link TBD)*
+- **GitHub**: [nullinbetween/apac-expense-manager](https://github.com/nullinbetween/apac-expense-manager)
 
-- **Natural language expense tracking**: Say "スタバ ラテ 550円" — the agent auto-detects Japan, categorizes under Food, and saves to BigQuery. Responses are natural language confirmations, not database output.
-- **5-language support**: Traditional Chinese, Simplified Chinese, English, Japanese, Korean — with OpenCC for accurate Traditional/Simplified Chinese conversion. Language detected automatically from input if user skips onboarding.
-- **Multi-currency intelligence**: Records in local currency. Cross-country summaries show original currency breakdown per country. Users can request conversion to any supported currency for approximate totals. 14 APAC currencies + global travel support.
-- **Conversation context**: The agent maintains context across turns. Say "Starbucks latte" (missing amount) → agent recognizes but doesn't save → reply just "100yen" → agent recalls the prior context and saves with full details. No need to repeat store, country, or category.
-- **Context-aware financial guidance**: Ask "if I cancel Netflix, how much do I save per year?" — the agent finds the monthly charge in BigQuery, calculates ¥23,760/year, and gives actionable savings suggestions based on real spending data.
-- **Emergent multi-tool reasoning**: No "modify" tool exists. When asked to change an expense, the agent reasons through: query → confirm with user → delete old → save new → report as single update. This behavior emerged from Gemini's reasoning, not hardcoded logic.
+## Key Capabilities
+
+- **Natural language expense tracking**: Say "スタバ ラテ 550円" — the agent auto-detects Japan, categorizes under Food, and saves to BigQuery. Works in Traditional Chinese, Simplified Chinese, English, Japanese, and Korean.
+- **Receipt recognition**: Snap a photo of any APAC receipt — Thai, Japanese, Hong Kong — the agent extracts store, amount, currency, and country automatically. Supports multi-slip photos and tax-inclusive amount detection.
+- **Intelligent correction**: Say "sorry it should be 500 yen" right after recording. The system detects the correction at the Python layer, intercepts before the model can misinterpret it, and routes to modify automatically. One step, no follow-up needed.
+- **Multi-currency intelligence**: Records in local currency. Summaries show original currency breakdown per country. Conversion to any supported currency on request. 14 APAC currencies + global travel support.
+- **Conversation context**: Say "Starbucks latte" (missing amount) → agent recognizes but doesn't save → reply "100yen" → agent recalls context and saves with full details. No need to repeat anything.
+- **Context-aware financial guidance**: Ask "if I cancel ベネッセ, how much do I save per year?" — the agent finds the ¥6,500 monthly charge, calculates ¥78,000/year, and gives actionable advice based on real spending data.
 
 ## Architecture
 
 ```
-User (ADK Web UI)
+User (ADK Web UI — text or receipt photo)
   ↓
 Primary Agent (apac_expense_manager) — Gemini 2.5 Flash on Vertex AI
-  ├── expense_categorizer  → Categorize + save to BigQuery via MCP Toolbox
-  ├── expense_query        → Query / delete / modify records (date, category, country, store)
-  └── expense_reporter     → Spending analysis with cross-currency conversion + financial guidance
+  ├── [FunctionTool] set_language        → Programmatic user_language guarantee
+  ├── [FunctionTool] modify_expense      → Direct BigQuery UPDATE (parameterized)
+  ├── expense_categorizer                → Categorize + save (with correction guard callbacks)
+  │     ├── before_model_callback        → Python-layer correction interception + auto-transfer
+  │     └── after_tool_callback          → State tracking + receipt confirmation hint
+  ├── expense_query                      → Query / delete records via MCP Toolbox
+  └── expense_reporter                   → Analysis + financial guidance
 ```
 
-### Tech Stack
+## Refinement Story: From Agentic Demo to Production-Ready System
 
-| Component | Technology | Why |
-|-----------|-----------|-----|
-| Framework | Google ADK (Agent Development Kit) | Multi-agent orchestration with sub-100ms tool routing |
-| Model | Gemini 2.5 Flash (Vertex AI) | Best cost-performance ratio for multilingual + reasoning tasks |
-| Database | BigQuery (via MCP Toolbox for Databases) | Scales from demo to production; SQL tools defined in YAML, no code changes needed |
-| Deployment | Cloud Run (europe-west1) | Serverless, zero cold-start config, auto-scaling |
-| Config | Secret Manager (tools.yaml, 11 versions) | Safe rollback capability for SQL tool definitions |
-| Language Processing | OpenCC | Accurate Traditional ↔ Simplified Chinese conversion in `after_model_callback` |
+During our first submission, the most impressive behavior was emergent: Gemini independently handled expense corrections by reasoning through query → confirm → delete → save. No "modify" tool existed — the agent figured it out.
+
+During refinement, the same behavior regressed. The identical prompt that worked on April 8 stopped working on April 28. **Model behavior is not a constant.** This became our core engineering challenge.
+
+Our response was a **hybrid architecture**:
+
+- **Keep Gemini for what it's best at**: multilingual understanding, receipt image parsing, intelligent classification, cross-currency financial analysis
+- **Harden with deterministic code where reliability is critical**: `modify_expense` FunctionTool for direct BigQuery UPDATE, `before_model_callback` for Python-layer correction interception, `after_tool_callback` for guaranteed state tracking
+
+We also discovered that prompt-based guards don't survive model regression — four iterations of prompt engineering all failed. The correction guard only became reliable when we moved it to Python code where the model has no opportunity to override.
+
+The result: a system that preserves agentic intelligence where it adds value, and guarantees correctness where it matters most.
+
+## Engineering Highlights
+
+- **Programmatic correction guard**: ADK's sub-agent stickiness means the categorizer stays active after saving. A user correction would be misinterpreted as a new expense. Our `before_model_callback` intercepts with regex detection, returns a canned response with `transfer_to_agent` embedded in the LlmResponse, and ADK routes back to root for `modify_expense`. Entire flow completes in one step.
+
+- **Receipt silence fix**: Gemini sometimes generates empty text after multimodal tool calls (receipt image → save → silence). The `after_tool_callback` appends a confirmation hint to the tool response, ensuring a user-facing confirmation is always produced.
+
+- **Emergent reasoning preserved**: The original emergent modify path (delete + save) is preserved alongside the deterministic `modify_expense` tool. Both paths coexist — demonstrating evolution from discovery to production hardening, not abandonment of agentic design.
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Framework | Google ADK (Agent Development Kit) |
+| Model | Gemini 2.5 Flash (Vertex AI) |
+| Database | BigQuery (MCP Toolbox + direct client) |
+| Deployment | Cloud Run (europe-west1) |
+| Config | Secret Manager (tools.yaml) |
+| Language Processing | OpenCC (Traditional ↔ Simplified Chinese) |
 
 ## Project Structure
 
@@ -51,86 +82,50 @@ Primary Agent (apac_expense_manager) — Gemini 2.5 Flash on Vertex AI
 apac_expense_manager/
 ├── apac_expense_manager/
 │   ├── __init__.py
-│   └── agent.py          # Main agent code (v7.6)
-├── tools.yaml             # MCP Toolbox SQL configuration (4 tools: save, query, delete, summary)
+│   └── agent.py          # Main agent code (v9.3, ~1155 lines)
+├── tools.yaml             # MCP Toolbox SQL config (4 tools)
 ├── Dockerfile
 ├── pyproject.toml
-├── seed_demo_data.sh      # Demo data loader (66 records, 6 countries)
-├── seed_demo_data.sql      # Same data in SQL format
-├── DEPLOY_GUIDE.md        # Step-by-step deployment instructions
+├── seed_demo_data.sh      # Demo data (66 records, 6 countries)
 └── README.md
 ```
 
 ## Deployment
 
-### Prerequisites
-
-- Google Cloud project with billing enabled
-- BigQuery dataset (`expense_data.expenses`)
-- Secret Manager secret for `tools.yaml`
-- Cloud Run services for both the agent and MCP Toolbox
-
-### Quick Deploy
-
 ```bash
-# Set environment
 export PROJECT_ID="your-project-id"
 export REGION="europe-west1"
 export TOOLBOX_URL="https://your-toolbox-url.run.app"
 
-# Deploy MCP Toolbox (BigQuery connector)
-gcloud run deploy expense-toolbox \
-  --image us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest \
-  --region=$REGION --project=$PROJECT_ID \
-  --set-env-vars="TOOLBOX_CONFIG_SOURCE=secret:expense-tools" \
-  --allow-unauthenticated --port=8080
-
 # Deploy Agent
-cd apac_expense_manager
 gcloud run deploy apac-expense-manager --source . \
   --project=$PROJECT_ID --region=$REGION \
-  --port=8000 --set-env-vars="TOOLBOX_URL=$TOOLBOX_URL" \
+  --port=8000 --set-env-vars="TOOLBOX_URL=$TOOLBOX_URL,PROJECT_ID=$PROJECT_ID" \
   --allow-unauthenticated
 ```
 
-See [DEPLOY_GUIDE.md](DEPLOY_GUIDE.md) for detailed instructions.
-
-## Demo Data
-
-Load 66 realistic expense records across 6 APAC countries (JP, HK, TW, SG, KR, TH) with a "Tokyo-based working single mom" persona:
-
-```bash
-bash seed_demo_data.sh
-```
-
-## Engineering Highlights
-
-- **Emergent modify = query + confirm + delete + save**: The agent decomposes "change Starbucks from ¥550 to ¥500" into four steps using only three base tools — demonstrating LLM reasoning beyond CRUD
-- **Product-grade UX from prompt engineering alone**: User-facing output uses natural language ("已記錄 Starbucks ¥550（日本／食費）"), internal reasoning (country detection, confidence scoring) stays hidden. No ID/UUID ever shown to users.
-- **Conversation context across turns**: Missing information (e.g., amount) triggers a clarify-first flow; user's follow-up with just the amount is understood in context without re-stating store/country/category
-- **UUID-based record identification**: Each expense has a unique `id` via `GENERATE_UUID()`. Enables reliable single-record operations instead of fragile composite key matching
-- **Dynamic date injection**: Dates injected at container startup to prevent Gemini from generating Python code when asked about "today" or "this month"
-- **Graceful language handling**: Language selection shown at session start; if skipped, agent auto-detects from input — never blocks the user
-- **APAC-first, globally aware**: Core support for 14 APAC countries/currencies, but accepts any ISO 3166 country code for travel scenarios
-
-## Version History
-
-| Version | Changes |
-|---------|---------|
-| v7.6 | Modify/delete UX polish — product voice, hide ID/UUID, minimum necessary info for confirmations |
-| v7.5 | User-facing output rewrite — natural language confirmations, no debug fields, missing amount clarify-first |
-| v7.4 | Currency display overhaul — breakdown-only by default, conversion only on request. First-turn language flow fix |
-| v7.3 | UUID primary key for all records. Reliable single-record delete |
-| v7.2 | Global country code support. Store name search (fuzzy match) |
-| v7.0 | Cross-currency conversion with fixed APAC exchange rates |
-| v6.0 | Language onboarding + OpenCC + date range query + delete function |
+Requires: Google Cloud project with BigQuery dataset, Secret Manager for tools.yaml, Cloud Run for both agent and MCP Toolbox. See `DEPLOY_GUIDE.md` for full instructions.
 
 ## Lessons Learned
 
-- **LLM as reasoning engine, not CRUD wrapper**: The most impressive demo moment — emergent modify — was never coded. Good agent architecture gives the model room to reason.
-- **Separate internal reasoning from user output**: Early versions showed debug fields (Country: JP, Category: Food, Confidence: HIGH) to users. Splitting prompt into "internal reasoning" vs "user-facing output" sections solved this cleanly.
-- **Pin your infrastructure versions**: The `toolbox:latest` image silently changed its default port from 5000 to 8080, causing startup failures. Lesson learned the hard way.
-- **Prompt engineering is product design**: Every v7.x release was a prompt-only change. No architecture changes, no new tools — just better instructions producing better user experience.
+- **Model behavior is not a constant**: The same Gemini 2.5 Flash prompt that worked reliably on April 8 stopped working on April 28. Production agent design means designing for model regression, not just model capability.
+
+- **Prompt-based guards don't survive regression**: Four iterations of prompt engineering failed. The solution was Python-layer interception where the model has no opportunity to override.
+
+- **Hybrid > pure agentic for production**: The most reliable architecture preserves model autonomy for classification and analysis, and hardens with deterministic code for financial writes. Neither pure agentic nor pure deterministic is optimal.
+
+- **ADK sub-agent stickiness is a design constraint**: After a sub-agent handles a message, it stays active for the next — bypassing root routing. Building reliable multi-agent systems on ADK requires callbacks, state flags, and explicit transfer mechanisms.
+
+## Version History
+
+| Version | Date | Milestone |
+|---------|------|-----------|
+| v9.3 | 2026-04-29 | Correction auto-transfer + receipt silence fix. Production ready. |
+| v9.0 | 2026-04-28 | modify_expense FunctionTool — direct BigQuery UPDATE |
+| v8.0 | 2026-04-23 | set_language FunctionTool — programmatic language guarantee |
+| v7.6 | 2026-04-08 | First submission version. Emergent modify, product-grade UX |
+| v6.0 | 2026-04-05 | Language onboarding + OpenCC + delete function |
+| v1.0 | 2026-04-03 | Initial multi-agent system |
 
 ## License
 
