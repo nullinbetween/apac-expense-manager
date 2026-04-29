@@ -6,5 +6,6 @@ requires-python = ">=3.10"
 dependencies = [
     "google-adk",
     "google-auth",
+    "google-cloud-bigquery",
     "opencc-python-reimplemented",
 ]

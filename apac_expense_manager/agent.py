@@ -1,45 +1,90 @@
 """
-APAC Expense Manager — Multi-Agent System (v7.3)
+APAC Expense Manager — Multi-Agent System (v9.3)
 Primary agent + 3 sub-agents for household expense management across Asia-Pacific.
 
-v7.3 changes:
-  - Added expense_id (UUID) for unique record identification
-  - delete_expense now uses ID instead of composite key (date+country+store+amount+currency)
-  - query_expenses returns ID for each record
-  - save_expense auto-generates UUID via GENERATE_UUID()
-v7.2 changes:
-  - Country list centralized (APAC_COUNTRIES/CURRENCIES/CATEGORIES variables)
-  - Non-APAC countries accepted (global travel support: ZA, US, GB, etc.)
-  - Store query parameter added (LIKE pattern match)
-  - VN/KH/MM added to APAC country + currency + exchange rate lists
-v7.1 changes:
-  - Language landing page strengthened (CRITICAL MANDATORY at top of root_agent)
+v9.3 changes:
+  - Correction interception now includes transfer_to_agent function call in the
+    LlmResponse. Previously, interception only returned canned text and stopped —
+    user had to manually ask again to trigger modify. Now ADK routes back to root
+    agent automatically, where modify_expense can be called with last_saved_expense.
+  - CORRECTION_SIGNALS regex tightened: removed 'edit', 'update', 'wait' (too
+    generic, caused false positives like "have u even edit my expenses?"). Changed
+    'change' to 'change it/to/the' for specificity.
+v9.2 changes:
+  - CRITICAL FIX: categorizer before_model_callback — programmatic correction
+    detection. When categorizer sub-agent is still active and receives a correction
+    message (sorry/should be/寫錯/修正/間違), Python intercepts BEFORE Gemini runs,
+    returns a canned response telling the user to rephrase for modify. This prevents
+    categorizer from saving corrections as new expenses (v9.1.1 prompt guard failed).
+  - last_saved_expense state: after categorizer successfully calls save_expense,
+    an after_tool_callback writes {store, amount, currency} to session state.
+    Root agent's modify_expense can then read these values instead of relying on
+    Gemini's conversation memory.
+  - Root agent prompt updated to read last_saved_expense from state.
+v9.1 changes:
+  - Receipt recognition: categorizer handles receipt images (from v8.2, prompt-only)
+  - Expense tagging: categorizer adds [child]/[household]/[reimbursable]/[transport]/[personal]
+    tags in notes field for downstream reimbursement reporting
+  - Reimbursement summary: reporter generates itemized reimbursement reports
+    (filtered by tags + category, copy-paste ready output)
+  - Cost-saving analysis: reporter does break-even calculations
+    (e.g., mama bicycle vs taxi comparison using actual spending data)
+v9.0 changes:
+  - modify_expense FunctionTool: programmatic expense modification via direct BigQuery
+    client. Replaces emergent delete+save reasoning that broke due to Gemini 2.5 Flash
+    model regression (same prompt worked 4/8, failed 4/28).
+    Design: root_agent calls modify_expense directly → bypasses delegation/routing.
+    BigQuery client does query→UPDATE in Python, no LLM reasoning needed.
+    "Emergence needs hardening" — critical workflows need programmatic guarantees.
+v8.1.4 changes:
+  - Hybrid approach: correction detection + enabling tone. Still failed — confirmed
+    as Gemini model regression, not prompt problem (v7.6 regression test 00026-bhq).
+v8.1.3 changes:
+  - Prompt tone rewrite: constraining → enabling. Reduced NEVER/ALWAYS/MUST overload.
+v8.1.2 changes:
+  - Root agent routing disambiguation + expense_query autonomous ID lookup.
+v8.1.1 changes:
+  - Explicit modify/change/update/correct routing to expense_query.
+v8.1 changes:
+  - Removed currency→country direct mapping (currency ≠ country in APAC reality)
+v8.0 changes (Refinement Phase):
+  - set_language tool: programmatic guarantee for user_language in session state
 v7.4 changes:
-  - Currency display: no default/primary currency. User specifies → convert; otherwise → original breakdown only.
-  - Removed all "default display currency" / "primary currency" concepts from FX_CONTEXT
-v7.3.1 changes:
-  - FX_CONTEXT injected into reporter prompt with strict priority order
+  - Currency display: no default/primary currency.
+v7.3 changes:
+  - expense_id (UUID) + delete by ID
+v7.2 changes:
+  - Country list centralized, non-APAC countries accepted, store query parameter added
 v7 changes:
   - Cross-currency conversion: fixed demo exchange rates (EXCHANGE_RATES_TO_JPY)
-  - Shows breakdown by original currency
-v6.1 changes:
-  - Dynamic date injection (fixes Gemini writing Python code)
 v6 changes:
   - Language onboarding + OpenCC + date range + delete expense + KR support
 
 Architecture:
-  Primary Agent (Router)
+  Primary Agent (Router + modify_expense tool)
   ├── expense_categorizer  → Categorize free-text expenses + save to BigQuery
   ├── expense_query        → Query BigQuery via MCP Toolbox (with date filtering)
   └── expense_reporter     → Generate spending analysis & insights
 """
 
+import logging
 import os
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
 from google.adk.agents import Agent
+from google.adk.models import LlmRequest, LlmResponse
+from google.adk.tools import FunctionTool, ToolContext
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StreamableHTTPConnectionParams
+from google.cloud import bigquery
 from google.genai import types
+
+logger = logging.getLogger(__name__)
+
+STATE_USER_LANGUAGE = "user_language"
+STATE_LAST_SAVED_EXPENSE = "last_saved_expense"
+STATE_CORRECTION_INTERCEPTED = "_correction_intercepted"
 
 # ---------------------------------------------------------------------------
 # Dynamic date context — so Gemini doesn't try to write Python code
@@ -150,7 +195,7 @@ def language_callback(callback_context, llm_response):
         return llm_response
 
     # Get user's language preference from session state
-    user_lang = callback_context.state.get("user_language", "")
+    user_lang = callback_context.state.get(STATE_USER_LANGUAGE, "")
 
     if not user_lang or user_lang not in ("繁體中文", "简体中文"):
         return llm_response
@@ -165,6 +210,212 @@ def language_callback(callback_context, llm_response):
                     part.text = t2s_converter.convert(part.text)
 
     return llm_response
+
+# ---------------------------------------------------------------------------
+# Language tool — programmatic guarantee for user_language in session state
+# ---------------------------------------------------------------------------
+VALID_LANGUAGES = {"繁體中文", "简体中文", "English", "日本語", "한국어"}
+LANGUAGE_NUMBER_MAP = {
+    "1": "繁體中文",
+    "2": "简体中文",
+    "3": "English",
+    "4": "日本語",
+    "5": "한국어",
+}
+
+def set_language(language: str, tool_context: ToolContext) -> str:
+    """Set the user's preferred language for this session.
+
+    Call this tool whenever the user selects a language (from the language picker
+    or detected from their input). This guarantees the language preference is
+    stored in session state for OpenCC and all sub-agents to use.
+
+    Args:
+        language: One of: 繁體中文, 简体中文, English, 日本語, 한국어
+    """
+    # Normalize: accept number shortcuts (1-5) from language picker
+    if language in LANGUAGE_NUMBER_MAP:
+        language = LANGUAGE_NUMBER_MAP[language]
+
+    if language not in VALID_LANGUAGES:
+        return f"Invalid language: {language}. Valid options: {', '.join(VALID_LANGUAGES)}"
+
+    tool_context.state[STATE_USER_LANGUAGE] = language
+    return f"Language set to {language}"
+
+set_language_tool = FunctionTool(set_language)
+
+# ---------------------------------------------------------------------------
+# modify_expense tool — direct BigQuery UPDATE, bypasses Gemini reasoning
+# ---------------------------------------------------------------------------
+# Why this exists: Gemini 2.5 Flash used to autonomously combine query+delete+save
+# to handle modify requests (emergent behavior, worked 4/8). The model regressed
+# by 4/28 — same prompt, same code, modify stopped working. Four rounds of prompt
+# engineering (v8.1.1-v8.1.4) all failed because the root cause was model-side.
+# Solution: hardcode the modify logic in Python. LLM only needs to extract params.
+# ---------------------------------------------------------------------------
+BQ_PROJECT = os.environ.get("PROJECT_ID", "my-project-2026-hackthon")
+BQ_TABLE = f"{BQ_PROJECT}.expense_data.expenses"
+
+
+def modify_expense(
+    old_store: str,
+    old_amount: str,
+    old_currency: str,
+    new_amount: str,
+    new_currency: str,
+    new_store: str,
+    new_country: str,
+    new_category: str,
+    tool_context: ToolContext,
+) -> str:
+    """Modify an existing expense record. Finds the record by old values, then updates it.
+
+    Use this when the user wants to correct or change a previously recorded expense.
+    Common triggers: "sorry it should be X", "change to X", "寫錯了", "修正", "間違えた"
+
+    To find the record, provide the OLD values (what was originally saved).
+    To update, provide the NEW values (what it should be changed to).
+    Pass empty string "" for any field you don't need to filter by or don't want to change.
+
+    Args:
+        old_store: Store name of the record to find (partial match, case-insensitive). Required.
+        old_amount: Original amount to match (e.g. "520"). Use "" to skip amount matching.
+        old_currency: Original currency code (e.g. "JPY"). Use "" to skip currency matching.
+        new_amount: New amount to set (e.g. "500"). Use "" to keep unchanged.
+        new_currency: New currency code. Use "" to keep unchanged.
+        new_store: New store name. Use "" to keep unchanged.
+        new_country: New 2-letter country code. Use "" to keep unchanged.
+        new_category: New category in Japanese. Use "" to keep unchanged.
+    """
+    try:
+        client = bigquery.Client(project=BQ_PROJECT)
+
+        # --- Step 1: Find matching record(s) ---
+        conditions = ["1=1"]
+        params = []
+
+        if old_store:
+            conditions.append("LOWER(store) LIKE CONCAT('%', LOWER(@old_store), '%')")
+            params.append(bigquery.ScalarQueryParameter("old_store", "STRING", old_store))
+
+        if old_amount:
+            conditions.append("amount = CAST(@old_amount AS FLOAT64)")
+            params.append(bigquery.ScalarQueryParameter("old_amount", "STRING", old_amount))
+
+        if old_currency:
+            conditions.append("currency = @old_currency")
+            params.append(bigquery.ScalarQueryParameter("old_currency", "STRING", old_currency))
+
+        where_clause = " AND ".join(conditions)
+        find_sql = f"""
+            SELECT id, date, country, category, amount, currency, store, subcategory, notes
+            FROM `{BQ_TABLE}`
+            WHERE {where_clause}
+            ORDER BY date DESC
+            LIMIT 5
+        """
+
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        results = list(client.query(find_sql, job_config=job_config).result())
+
+        if len(results) == 0:
+            return (
+                f"No matching expense found for store='{old_store}'"
+                f"{f', amount={old_amount}' if old_amount else ''}"
+                f"{f', currency={old_currency}' if old_currency else ''}. "
+                "Please check the details and try again."
+            )
+
+        if len(results) > 1:
+            lines = []
+            for r in results:
+                lines.append(
+                    f"- {r['store']} {r['amount']} {r['currency']} "
+                    f"on {r['date']} ({r['category']})"
+                )
+            return (
+                f"Found {len(results)} matching records:\n"
+                + "\n".join(lines)
+                + "\nPlease be more specific (add amount or currency to narrow down)."
+            )
+
+        # --- Step 2: Exactly one match — UPDATE it ---
+        record = results[0]
+        record_id = record["id"]
+
+        updates = []
+        update_params = [
+            bigquery.ScalarQueryParameter("record_id", "STRING", record_id)
+        ]
+        change_log = []
+
+        if new_amount:
+            updates.append("amount = CAST(@new_amount AS FLOAT64)")
+            update_params.append(
+                bigquery.ScalarQueryParameter("new_amount", "STRING", new_amount)
+            )
+            change_log.append(f"amount: {record['amount']} → {new_amount}")
+
+        if new_currency:
+            updates.append("currency = @new_currency")
+            update_params.append(
+                bigquery.ScalarQueryParameter("new_currency", "STRING", new_currency)
+            )
+            change_log.append(f"currency: {record['currency']} → {new_currency}")
+
+        if new_store:
+            updates.append("store = @new_store")
+            update_params.append(
+                bigquery.ScalarQueryParameter("new_store", "STRING", new_store)
+            )
+            change_log.append(f"store: {record['store']} → {new_store}")
+
+        if new_country:
+            updates.append("country = @new_country")
+            update_params.append(
+                bigquery.ScalarQueryParameter("new_country", "STRING", new_country)
+            )
+            change_log.append(f"country: {record['country']} → {new_country}")
+
+        if new_category:
+            updates.append("category = @new_category")
+            update_params.append(
+                bigquery.ScalarQueryParameter("new_category", "STRING", new_category)
+            )
+            change_log.append(f"category: {record['category']} → {new_category}")
+
+        if not updates:
+            return (
+                f"Found: {record['store']} {record['amount']} {record['currency']}. "
+                "But no new values provided. Please specify what to change "
+                "(e.g., new_amount, new_currency)."
+            )
+
+        update_sql = f"""
+            UPDATE `{BQ_TABLE}`
+            SET {', '.join(updates)}
+            WHERE id = @record_id
+        """
+
+        update_config = bigquery.QueryJobConfig(query_parameters=update_params)
+        client.query(update_sql, job_config=update_config).result()
+
+        logger.info(
+            f"modify_expense: updated record {record_id} — {', '.join(change_log)}"
+        )
+
+        return (
+            f"Updated successfully: {record['store']} "
+            f"{record['amount']} {record['currency']} → {', '.join(change_log)}."
+        )
+
+    except Exception as e:
+        logger.error(f"modify_expense error: {e}")
+        return f"Error modifying expense: {str(e)}"
+
+
+modify_expense_tool = FunctionTool(modify_expense)
 
 # ---------------------------------------------------------------------------
 # MCP Toolset — connects to MCP Toolbox for BigQuery
@@ -205,16 +456,209 @@ LANGUAGE_INSTRUCTION = """
 """
 
 # ---------------------------------------------------------------------------
+# Categorizer guard: before_model_callback — intercept corrections BEFORE Gemini
+# ---------------------------------------------------------------------------
+# Why this exists: ADK sub-agent "stickiness" means that after categorizer handles
+# a message, the NEXT user message may go directly to categorizer without root
+# routing. If that message is a correction ("sorry it should be 500"), categorizer
+# saves it as a NEW expense. Prompt-based guards (v9.1.1) were completely ignored
+# by Gemini. This callback runs in Python BEFORE Gemini sees the message, so it
+# cannot be overridden by the model.
+# ---------------------------------------------------------------------------
+CORRECTION_SIGNALS = re.compile(
+    r"(?:sorry|actually|should\s+be|wrong|change\s+(?:it|to|the)|no\s+no|oops|"
+    r"寫錯|應該|改成|不對|搞錯|修正|唔係|唔啱|"
+    r"間違|違う|修正して|変更して|ごめん|"
+    r"잘못|고쳐|수정)",
+    re.IGNORECASE
+)
+
+
+def _extract_latest_user_text(llm_request: LlmRequest) -> str:
+    """Return the latest user-authored text in the request, or an empty string."""
+    if not llm_request.contents:
+        return ""
+
+    for content in reversed(llm_request.contents):
+        if content.role != "user" or not content.parts:
+            continue
+        for part in content.parts:
+            if part.text:
+                return part.text
+    return ""
+
+
+def _get_correction_intercept_message(user_lang: str) -> str:
+    """Return the localized interception message for correction attempts."""
+    messages = {
+        "繁體中文": "這看起來是在修正上一筆紀錄，我來幫你更新。",
+        "简体中文": "这看起来是在修正上一笔记录，我来帮你更新。",
+        "日本語": "前の記録の修正ですね。こちらで更新します。",
+        "한국어": "이전 기록 수정이네요. 제가 바로 업데이트할게요.",
+    }
+    return messages.get(
+        user_lang,
+        "This looks like a correction. I'll update it now.",
+    )
+
+
+def _has_correction_signal(user_text: str) -> bool:
+    """Return True when the user text looks like a correction/modification turn."""
+    return bool(user_text and CORRECTION_SIGNALS.search(user_text))
+
+
+def _get_tool_name(tool) -> str:
+    """Best-effort extraction of a tool's name across wrapper types."""
+    return str(getattr(tool, "name", "") or tool or "").strip()
+
+
+def _is_save_expense_tool(tool) -> bool:
+    """Return True when the callback is running for save_expense."""
+    tool_name = _get_tool_name(tool)
+    if not tool_name:
+        return False
+    if tool_name == "save_expense":
+        return True
+
+    terminal_name = re.split(r"[:./]", tool_name)[-1]
+    return terminal_name == "save_expense" or "save_expense" in tool_name
+
+
+def _tool_response_indicates_success(tool_response) -> bool:
+    """Best-effort success check for after_tool callbacks."""
+    if tool_response is None:
+        return True
+
+    if getattr(tool_response, "is_error", False):
+        return False
+
+    if isinstance(tool_response, dict):
+        if tool_response.get("is_error") is True:
+            return False
+        status = str(tool_response.get("status", "")).lower()
+        if status in {"error", "failed"}:
+            return False
+
+    response_text = str(tool_response).lower()
+    return not any(token in response_text for token in ("error", "failed", "exception", "traceback"))
+
+
+def categorizer_before_model(callback_context, llm_request):
+    """Intercept correction messages before Gemini processes them.
+
+    If the user's latest message contains correction signals, return a canned
+    LlmResponse that tells the user to ask for a modification. This prevents
+    categorizer from saving corrections as new expenses.
+
+    Uses a state flag to only intercept ONCE per correction attempt. After the
+    first interception, one correction-like follow-up is allowed through to
+    avoid NPC-like repetition loops.
+
+    Returns:
+        LlmResponse if correction detected (first time), None otherwise.
+    """
+    # Consume the interception flag FIRST — before checking user_text.
+    # This prevents stale flags when a non-text turn (e.g. image-only)
+    # arrives after an interception.
+    if callback_context.state.get(STATE_CORRECTION_INTERCEPTED):
+        callback_context.state[STATE_CORRECTION_INTERCEPTED] = False
+        user_text = _extract_latest_user_text(llm_request)
+        if user_text and _has_correction_signal(user_text):
+            logger.info(
+                "categorizer_before_model: allowing one correction follow-up after interception"
+            )
+        return None  # Always let through after one interception (text or not)
+
+    user_text = _extract_latest_user_text(llm_request)
+
+    if not user_text:
+        return None  # No text to check, let Gemini handle
+
+    if _has_correction_signal(user_text):
+        callback_context.state[STATE_CORRECTION_INTERCEPTED] = True
+
+        user_lang = callback_context.state.get(STATE_USER_LANGUAGE, "English")
+        msg = _get_correction_intercept_message(user_lang)
+
+        logger.info(f"categorizer_before_model: correction detected in '{user_text[:50]}...', blocking save and transferring to root")
+
+        # Return a canned response with transfer_to_agent function call.
+        # This tells ADK to route the conversation back to the root agent,
+        # where modify_expense can be called with last_saved_expense state.
+        return LlmResponse(
+            content=types.Content(
+                parts=[
+                    types.Part(text=msg),
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name="transfer_to_agent",
+                            args={"agent_name": "apac_expense_manager"},
+                        )
+                    ),
+                ],
+                role="model",
+            )
+        )
+
+    # Not a correction — clear any stale flag
+    callback_context.state[STATE_CORRECTION_INTERCEPTED] = False
+    return None  # Let Gemini handle normally
+
+
+# ---------------------------------------------------------------------------
+# Categorizer after_tool_callback — save last expense to state for modify
+# ---------------------------------------------------------------------------
+def categorizer_after_tool(tool, args, tool_context, tool_response):
+    """After save_expense succeeds, write the saved values to session state.
+
+    This allows root_agent's modify_expense to read old_store/old_amount/old_currency
+    from state instead of relying on Gemini's conversation memory.
+
+    Returns:
+        None (does not modify the tool response).
+    """
+    if not _is_save_expense_tool(tool):
+        return None
+
+    if not _tool_response_indicates_success(tool_response):
+        logger.warning(
+            "categorizer_after_tool: save_expense did not clearly succeed, skipping last_saved_expense update"
+        )
+        return None
+
+    store = args.get("store", "")
+    amount = args.get("amount", "")
+    currency = args.get("currency", "")
+    country = args.get("country", "")
+    category = args.get("category", "")
+
+    if store and amount and amount != "0":
+        tool_context.state[STATE_LAST_SAVED_EXPENSE] = {
+            "store": store,
+            "amount": amount,
+            "currency": currency,
+            "country": country,
+            "category": category,
+        }
+        logger.info(
+            f"categorizer_after_tool: saved last_saved_expense to state: "
+            f"{store} {amount} {currency}"
+        )
+
+    return None  # Don't modify the tool response
+
+
+# ---------------------------------------------------------------------------
 # Sub-Agent 1: Expense Categorizer
 # ---------------------------------------------------------------------------
 expense_categorizer = Agent(
     name="expense_categorizer",
     model=model_name,
-    description="Categorizes free-text expense descriptions into structured data with APAC country/currency detection, and saves them to the database.",
+    description="Categorizes expenses into structured data with APAC country/currency detection, and saves them to the database. Handles both free-text descriptions AND receipt/image inputs (photos of receipts, credit card slips, etc.).",
     instruction=f"""You are a smart expense categorizer for people who live and travel across Asia-Pacific.
 
-**Your task:** The user gives you a free-text expense description. You:
-1. Analyze and categorize it (internally)
+**Your task:** The user gives you an expense — either as free text, a photo of a receipt, or both. You:
+1. Analyze and categorize it (internally — from text or by reading the image)
 2. Save it to BigQuery using the save_expense tool
 3. Return a short, natural-language confirmation to the user
 
@@ -229,17 +673,40 @@ You must internally determine these fields for the save_expense tool call:
 - currency: {APAC_CURRENCIES}, or any other currency code
 - store: store or service name
 - subcategory: more specific label
-- notes: any assumptions made (for database record only)
+- notes: see EXPENSE TAGGING section below — include tags here
 - confidence: HIGH / MEDIUM / LOW (internal assessment only)
 
 **Country detection logic (internal only — never explain these rules to the user):**
-1. Explicit currency → direct mapping: yen/円=JP, HKD=HK, SGD=SG, TWD/NT$=TW, baht/฿=TH, won/₩=KR, MYR/RM=MY
-2. Store clues: セブン/ファミマ/ローソン=JP, 翠華/大家樂/八達通=HK, hawker/EZLink/NTUC=SG, 悠遊卡/捷運/全聯=TW, CU/GS25/배달의민족/카카오=KR, 7-Eleven+baht=TH
-3. Bare "$" with no other context → default HKD
-4. Vietnamese dong/₫=VN, Cambodian riel/៛=KH, Myanmar kyat=MM
-5. Non-APAC countries are ALSO valid! Use standard country codes: ZA, US, GB, FR, DE, IT, ES, etc.
-6. No clue at all → default JP
-7. Global services (Netflix, Spotify) → default JP
+1. Store clues: セブン/ファミマ/ローソン=JP, 翠華/大家樂/八達通=HK, hawker/EZLink/NTUC=SG, 悠遊卡/捷運/全聯=TW, CU/GS25/배달의민족/카카오=KR, 7-Eleven+baht=TH
+2. Bare "$" with no other context → default HKD
+3. Vietnamese dong/₫=VN, Cambodian riel/៛=KH, Myanmar kyat=MM
+4. Non-APAC countries are ALSO valid! Use standard country codes: ZA, US, GB, FR, DE, IT, ES, etc.
+5. No clue at all → default JP
+6. Global services (Netflix, Spotify) → default JP
+7. IMPORTANT: Currency and country are INDEPENDENT fields. Currency tells you what currency was used, NOT necessarily which country the expense occurred in. Use location context (e.g., "in hong kong", "at Tokyo station") as the primary signal for country. Only fall back to currency-based inference when no location context is available.
+
+---
+
+**EXPENSE TAGGING (store tags in the notes field):**
+
+For every expense, add relevant tags at the START of the notes field. Tags help generate reimbursement reports and financial analysis later. Use these tags:
+
+- `[child]` — child-related expense (kids' meals, school fees, nursery, childcare items, kids' clothes, strollers, diapers, toys, kids' books, 保育園, 幼稚園, 子ども用品)
+- `[household]` — household expense (groceries, cleaning supplies, utilities, rent, home maintenance)
+- `[reimbursable]` — potentially reimbursable (work meals, business transport, child-related receipts that may be claimable, school-related, 医療費)
+- `[personal]` — personal expense (personal shopping, entertainment, beauty)
+- `[transport]` — transportation (taxi, train, bus, grab, uber — useful for cost-saving analysis)
+
+Multiple tags can be combined: `[child][reimbursable] nursery fee receipt`
+
+Examples:
+- McDonald's Happy Meal → notes: "[child][household] kids meal"
+- Taxi to nursery → notes: "[child][transport][reimbursable] nursery drop-off"
+- Netflix subscription → notes: "[personal] streaming"
+- Supermarket groceries → notes: "[household] weekly groceries"
+- 保育園月謝 → notes: "[child][reimbursable] nursery monthly fee"
+
+The tags are internal — do NOT show them to the user in your response.
 
 ---
 
@@ -260,6 +727,7 @@ Do NOT show the user any of these internal fields:
 - Country: / Category: / Amount: / Currency: / Store: / Sub-category: / Confidence: / Notes: / Status:
 - Do NOT show "Confidence: LOW" or "Amount: 0" or "Status: Not saved"
 - Do NOT mention internal fallback rules (e.g., "assumed JP because..." or "defaulted to HKD because...")
+- Do NOT show the tags ([child], [household], etc.) to the user
 
 The user should see a clean, product-quality response — not a debug log.
 
@@ -273,6 +741,73 @@ The user should see a clean, product-quality response — not a debug log.
 
 {LANGUAGE_INSTRUCTION}
 
+**RECEIPT / IMAGE RECOGNITION:**
+
+If the user sends an image (photo of a receipt, credit card slip, or any expense-related document):
+
+1. **Analyze the image** — extract all visible information:
+   - Store/merchant name (keep original text as-is — Japanese, Thai, Chinese, Korean, etc.)
+   - Total amount (use the tax-inclusive amount — see tax rules below)
+   - Currency (infer from receipt language, currency symbols, or country context)
+   - Country (infer from store name, language on receipt, address, or currency)
+   - Date (if visible on receipt; otherwise skip — system will use today's date)
+   - Category (infer from store type / items purchased)
+   - Any credit card last-4-digits visible (store in notes field if present)
+
+2. **Multi-receipt recognition** — the photo may contain multiple pieces of paper:
+   - A merchant receipt (レシート) AND a credit card transaction slip side by side
+   - Extract store name and items from the merchant receipt
+   - Extract card info from the credit card slip
+   - Combine into ONE expense entry (not two separate entries)
+
+3. **Tax-inclusive amount rules (APAC-specific):**
+   - Japan (JP): Always use 税込 (tax-included) amount. If both 税抜 and 税込 are shown, use 税込.
+   - Thailand (TH): Total usually includes 7% VAT. Use the final total.
+   - Australia (AU): Prices include GST. Use the total shown.
+   - Singapore (SG): Prices include 9% GST. Use the total shown.
+   - India (IN): Look for "Total" or "Grand Total" which includes GST.
+   - General rule: Always use the FINAL total the customer actually paid, not subtotals.
+
+4. **After extraction**, follow the same save flow as text expenses:
+   - Call save_expense with the extracted fields (all as strings)
+   - Include expense tags in notes (see EXPENSE TAGGING section)
+   - Reply with a natural-language confirmation showing what was recognized
+   - If the amount is unclear or the image is too blurry, tell the user what you could recognize and ask them to supplement
+
+5. **User-facing output for receipt recognition:**
+   - Good: "已從收據辨識：松屋，¥650，食費，日本。"
+   - Good: "Recognized from receipt: Matsumoto Kiyoshi, ¥2,180, Daily Necessities, Japan."
+   - Good: "レシートから記録しました：ファミリーマート、¥430、食費、日本。"
+   - If partial: "我從收據辨識到這是日本 FamilyMart 的消費，但金額看不清楚。可以補上金額嗎？"
+
+---
+
+**CORRECTION DETECTION — DO NOT SAVE:**
+
+BEFORE saving any expense, check if the user's message is actually a CORRECTION to a previously recorded expense, NOT a new expense. Correction signals include:
+
+- "sorry", "actually", "should be", "wrong", "change", "edit", "no no", "wait"
+- "寫錯了", "寫錯", "應該", "改成", "不對", "搞錯", "修正"
+- "間違", "違う", "修正して", "変更して"
+- "잘못", "고쳐", "수정"
+- A bare amount with no new store name, right after you just saved something
+
+If you detect ANY of these signals:
+1. Do NOT call save_expense
+2. Reply briefly that this is a correction and it will be updated (e.g. "This looks like a correction. I'll help update the previous expense.")
+3. Transfer control back to the parent agent (the root agent handles modifications with the modify_expense tool)
+
+Examples of corrections (do NOT save these):
+- Just saved "的士 HKD30", user says "寫錯了 應該60HKD" → DO NOT SAVE, transfer back
+- Just saved "Starbucks ¥520", user says "sorry it should be 500" → DO NOT SAVE, transfer back
+- Just saved something, user says "不對 是300" → DO NOT SAVE, transfer back
+
+Examples of NEW expenses (DO save these):
+- "starbucks latte 550 yen" → new store + amount + context → SAVE
+- "lunch at 大家樂 $85" → new store + amount → SAVE
+
+---
+
 **Other rules:**
 1. Missing amount → internally set "0", do NOT call save_expense, reply naturally asking for the amount
 2. Too vague → Category その他, note in internal fields, still try to save if amount is present
@@ -280,7 +815,9 @@ The user should see a clean, product-quality response — not a debug log.
 4. Never make up information
 """,
     tools=[categorizer_toolset],
+    before_model_callback=categorizer_before_model,
     after_model_callback=language_callback,
+    after_tool_callback=categorizer_after_tool,
 )
 
 # ---------------------------------------------------------------------------
@@ -306,23 +843,24 @@ expense_query = Agent(
 - "今日" / "today" / "오늘" → date_from = "{TODAY_DATE}", date_to = "{TODAY_DATE}"
 - "昨日" / "yesterday" / "어제" → date_from = "{YESTERDAY_DATE}", date_to = "{YESTERDAY_DATE}"
 - No date mentioned → use empty strings "" (all dates)
+- "最近N筆" / "latest N entries" / "last N records" / "최근 N건" → query with date_from = "" and date_to = "" (returns up to 50 results sorted by date DESC), then show only the first N results to the user. The tool always returns results sorted newest-first, so just take the top N.
 
 **Delete handling:**
-- When user asks to delete an expense, FIRST use query_expenses to find and show the matching record(s) — the results include each record's unique ID
-- NEVER show the raw ID/UUID to the user — keep it internal for the delete_expense call only.
-- Show MINIMUM necessary info to identify the record. Single match: just store + amount is enough. Only add date/category/country if needed to disambiguate multiple matches.
-- Only call delete_expense with the record's ID AFTER the user confirms
-- Never delete without showing the user what will be deleted first
-- Example (single match): "I found a Starbucks expense for ¥550. Delete it?"
-- Example (multiple): "I found two Starbucks expenses from today: ¥550 and ¥680. Which one would you like to delete?"
+When the user wants to delete an expense, use query_expenses to find it, confirm with the user, then delete.
+- Keep the ID internal — the user just needs to see store + amount to confirm
+- Single match: "Found Starbucks ¥550. Delete it?"
+- Multiple matches: "Found two Starbucks today: ¥550 and ¥680. Which one?"
 
 **Modify handling (delete + save):**
-- When user asks to CHANGE/MODIFY/UPDATE an expense, treat it as one product action, not two database operations.
-- First query to find the record, then ask the user to confirm the change in ONE natural sentence.
-- After completing, report as a single update — do NOT narrate "deleted old record, saved new record" separately.
-- Example before: "I found a Starbucks expense for ¥550. Would you like me to change it to ¥500?"
-- Example after: "Done — updated to ¥500."
-- Example (multiple matches): "I found two Starbucks expenses today: ¥550 and ¥680. Which one would you like to update?"
+You are fully capable of modifying expenses. Think of it as one smooth action: find the old record → confirm with user → replace it. You have all the tools: query_expenses to find it, delete_expense to remove the old one, save_expense to create the corrected one.
+
+When the user wants to change a previously recorded expense:
+1. Use query_expenses to find the matching record (you can look up any record by store, amount, date, etc.)
+2. Confirm with the user in one natural sentence: "I found Starbucks ¥550. Change to ¥500?"
+3. After confirmation: delete the old record, save the new one
+4. Report naturally: "Done — updated to ¥500." (present it as one action, not two)
+
+If multiple records match, show them and let the user pick. Keep the ID internal — the user never needs to see it.
 
 **Response rules:**
 1. Format currencies: ¥ for JPY, HK$ for HKD, S$ for SGD, NT$ for TWD, ฿ for THB, ₩ for KRW, RM for MYR
@@ -351,12 +889,12 @@ expense_reporter = Agent(
     name="expense_reporter",
     model=model_name,
     description="Generates spending analysis reports, trend insights, budget comparisons, and financial summaries across APAC countries. Supports date-range-based analysis, cross-currency summaries, and conversion when the user requests a target currency.",
-    instruction=f"""You are an APAC household finance analyst. You generate insightful spending reports and analysis.
+    instruction=f"""You are an APAC household finance analyst. You generate insightful spending reports, reimbursement summaries, and cost-saving analysis.
 
-**Your role:** Go beyond raw data — provide analysis, patterns, insights, and actionable recommendations.
+**Your role:** Go beyond raw data — provide analysis, patterns, insights, and actionable recommendations. You are the financial intelligence layer for a busy APAC household.
 
 **Available MCP tools (same as query agent):**
-- query_expenses: Search expenses by country, category, and date range (date_from, date_to in YYYY-MM-DD)
+- query_expenses: Search expenses by country, category, store, and date range (date_from, date_to in YYYY-MM-DD)
 - get_spending_summary: Get totals by country and category, with date range support
 
 {DATE_CONTEXT}
@@ -394,6 +932,79 @@ expense_reporter = Agent(
    - Comparison with previous periods (query both periods and compare)
    - Month-over-month trends
 
+5. **Reimbursement Summary** (NEW — key feature)
+   When the user asks for a reimbursement summary or report:
+   - Query ALL expenses for the requested period using query_expenses
+   - Look at the notes field for tags: [child], [household], [reimbursable], [transport], [personal]
+   - Also use the category field: 子供関連 = child-related, 交通 = transport, 医療 = medical (often reimbursable)
+   - Group reimbursable expenses by category, then by merchant
+   - Output format:
+     a) Summary header with period and total reimbursable amount
+     b) Itemized list grouped by category (store, amount, date)
+     c) Total by currency
+     d) A brief, polite reimbursement note the user can copy-paste
+
+   Example output:
+   ---
+   📋 April 2026 Reimbursement Summary — Child-Related Expenses
+
+   🍽️ Food (child-related):
+   - McDonald's ¥1,240 (Apr 5) — Happy Meal
+   - FamilyMart ¥430 (Apr 8) — kids' snacks
+
+   🚕 Transport (nursery):
+   - Taxi ¥2,800 (Apr 3) — nursery drop-off
+   - Taxi ¥2,600 (Apr 10) — nursery pick-up
+
+   🏫 Childcare:
+   - 保育園 ¥45,000 (Apr 1) — monthly fee
+
+   💰 Total: ¥52,070 JPY
+
+   📝 Reimbursement note:
+   "The above child-related expenses for April 2026 total ¥52,070 JPY.
+   Itemized receipts are available upon request."
+   ---
+
+   If no tags are present in notes, fall back to category-based classification:
+   - 子供関連 → child-related, likely reimbursable
+   - 交通 → transport, check if nursery/school related
+   - 医療 → medical, often reimbursable
+   - 食費 with child context → potentially reimbursable
+
+6. **Cost-Saving Decision Support** (NEW — key feature)
+   When the user asks about cost-saving, cost comparison, or break-even analysis:
+   - Query relevant expense data (e.g., transport costs for the last 30-60 days)
+   - Calculate monthly averages
+   - Compare against an alternative the user proposes (e.g., buying a bicycle, cooking at home, switching plans)
+   - Output: current monthly cost → alternative cost → break-even period → recommendation
+
+   Example (mama bicycle):
+   ---
+   🚲 Cost-Saving Analysis: Mama Bicycle vs. Taxi
+
+   📊 Recent child-related transport expenses:
+   - Last 30 days: ¥18,400
+   - Last 60 days: ¥35,200 (avg ¥17,600/month)
+
+   🆚 Comparison:
+   - Monthly taxi cost: ~¥18,000/month
+   - Electric mama bicycle (e.g., Panasonic Gyutto): ~¥150,000
+   - Maintenance/charging: ~¥500/month
+
+   ⏱️ Break-even: 150,000 ÷ (18,000 - 500) ≈ 8.6 months
+
+   💡 Recommendation: If this transport pattern continues for 9+ months,
+   a mama bicycle would save money. Also consider: weather, distance to
+   nursery, and whether you sometimes need the taxi for other errands.
+   ---
+
+   Guidelines for cost-saving analysis:
+   - Use ACTUAL data from the database, not hypothetical numbers
+   - State assumptions clearly
+   - Include non-financial factors when relevant
+   - Be practical — the user is making real household decisions
+
 **Response format:**
 - Use headers and clear sections
 - Include actual numbers with currency symbols (¥, HK$, S$, NT$, ฿, ₩, RM)
@@ -408,6 +1019,8 @@ expense_reporter = Agent(
 - Highlight the user's spending priorities (what they spend most on)
 - Be practical — this is a busy parent managing a household across multiple countries
 - If asked for budget advice, base it on actual spending patterns, not generic advice
+- For reimbursement reports: be thorough, include every qualifying expense, and make the output copy-paste ready
+- For cost-saving analysis: be honest about assumptions, use real data, include break-even calculations
 """,
     tools=[reporter_toolset],
     after_model_callback=language_callback,
@@ -436,60 +1049,100 @@ Please choose your language / 請選擇語言：
 4. 日本語
 5. 한국어
 
-When the user replies with a number or language:
-- Save their choice to session state: state["user_language"] = their chosen language
-- Confirm in their chosen language that the language has been set
+When the user replies with a number or language name:
+- IMMEDIATELY call the set_language tool with their choice (e.g., set_language("繁體中文") or set_language("1"))
+- After the tool confirms, respond in their chosen language that the language has been set
 - THEN proceed normally
 
 **Case B — The first message already contains a request, expense, or question:**
-Skip the language picker. Detect language from the input text, save it to state["user_language"], and process the request immediately. Do NOT show the language picker AND process the request in the same turn.
+Skip the language picker. Detect the language from the input text, call set_language with the detected language, and process the request immediately. Do NOT show the language picker AND process the request in the same turn.
+
+**CRITICAL: Always use the set_language tool to set the language. Never try to write to session state directly.**
+
+**Mid-conversation language switching:**
+If the user asks to change or switch language at any point in the conversation, immediately call set_language with the requested language, then continue responding in that language.
+Examples:
+- "改成日文" → set_language("日本語")
+- "switch to English" → set_language("English")
+- "한국어로 해줘" → set_language("한국어")
+- "用簡體" → set_language("简体中文")
 
 ---
 
-You are the APAC Expense Manager, a multi-agent system for managing household expenses across Asia-Pacific countries. Supported country codes: {APAC_COUNTRIES}.
+You are the APAC Expense Manager, a smart multi-agent system for managing household expenses across Asia-Pacific countries. Supported country codes: {APAC_COUNTRIES}.
 
-**Your role:** Route user requests to the right sub-agent. You coordinate three specialists:
+**Your role:** You are the router AND you handle expense modifications directly.
 
-1. **expense_categorizer** — Use when the user:
-   - Sends a new expense to record (e.g., "lunch at Yoshinoya 650 yen", "八達通增值 $150", "배달의민족 치킨 25000원")
-   - Wants to categorize an expense
-   - Sends any text that looks like an expense entry
+**Your tools:**
+- **set_language** — set the user's preferred language
+- **modify_expense** — directly modify an existing expense record in the database. YOU call this tool yourself, no delegation needed.
 
-2. **expense_query** — Use when the user:
-   - Asks about past expenses (e.g., "How much did I spend in Japan?", "Show my food expenses")
-   - Wants to search or filter expense records
-   - Asks for data by date range (e.g., "3月花了多少", "上個月的交通費")
-   - Wants to DELETE an expense record (query agent handles the confirm-then-delete flow)
+**Your sub-agents:**
+1. **expense_categorizer** — for recording **new** expenses (text OR receipt images)
+   Text: "lunch at Yoshinoya 650 yen", "八達通增值 $150", "배달의민족 치킨 25000원"
+   Image: user sends a photo of a receipt, credit card slip, or expense document
 
-3. **expense_reporter** — Use when the user:
-   - Asks for analysis or reports (e.g., "Give me a spending report", "Compare my spending across countries")
-   - Wants insights or trends (e.g., "What are my spending patterns?", "Where can I save money?")
-   - Asks for monthly summaries or period comparisons (e.g., "3月 vs 4月", "今月の分析")
-   - Asks for budget advice based on their data
-   - Asks for TOTAL spending across all countries (reporter handles cross-currency summaries; conversion only when user requests a target currency)
+2. **expense_query** — for **searching** existing records and **deleting** them
+   Examples: "How much did I spend?", "delete the Starbucks entry", "show my expenses today"
 
-**Multi-step workflow examples:**
-- "Record this expense and show me today's total" → categorizer first, then query
-- "How does my Japan food spending compare to Hong Kong?" → reporter (it will query and analyze)
-- "Log 'starbucks latte 550' and tell me my cafe spending this month" → categorizer, then reporter
-- "Delete the Starbucks entry from today" → query agent (it will find, confirm, then delete)
-- "這個月總共花了多少" → reporter (it will query all countries and show per-currency breakdown; converts only if user specifies a target currency)
+3. **expense_reporter** — for **analysis, insights, reimbursement summaries, and cost-saving analysis**
+   Analysis: "Give me a spending report", "Compare Japan vs Hong Kong", "今月の分析"
+   Reimbursement: "Generate reimbursement summary for April", "子供関連の請求書", "child-related expenses report"
+   Cost-saving: "Would a mama bicycle save money?", "Compare taxi vs bicycle costs"
+
+---
+
+**MODIFY = call modify_expense directly (do NOT delegate)**
+
+When the user wants to correct or change a previously recorded expense, call the modify_expense tool yourself. Do NOT delegate to expense_query for modifications.
+
+**How to use modify_expense:**
+- old_store: the store name from the original record (required — at least provide this)
+- old_amount: the original amount (helps find the exact record)
+- old_currency: the original currency (helps find the exact record)
+- new_amount / new_currency / new_store / new_country / new_category: the corrected values
+- Pass "" for any field you don't need
+
+**IMPORTANT — Reading last_saved_expense from state:**
+Check session state for 'last_saved_expense'. It contains the most recently saved expense:
+  last_saved_expense.store, last_saved_expense.amount, last_saved_expense.currency,
+  last_saved_expense.country, last_saved_expense.category
+When the user says "寫錯了 應該60HKD" or "sorry it should be 500", use the values from
+last_saved_expense as the old_store / old_amount / old_currency parameters. This is more
+reliable than relying on conversation memory.
+
+**Correction signals (call modify_expense):**
+- "sorry", "actually", "should be", "wrong", "change", "edit", "update"
+- "改", "修正", "寫錯", "間違", "잘못", "고쳐"
+- A bare amount right after recording (e.g. "500 yen" after just saving something) — likely a correction
+- Any reference to changing a previously recorded entry
+- If the categorizer returns a message saying "this looks like a correction" — the user was trying to modify, so call modify_expense
+
+**Examples:**
+- User just recorded "starbucks 520 yen", then says "sorry it should be 500 yen"
+  → Read last_saved_expense from state → modify_expense(old_store="starbucks", old_amount="520", old_currency="JPY", new_amount="500", new_currency="", new_store="", new_country="", new_category="")
+- "change the starbucks from 520 to 500 yen"
+  → modify_expense(old_store="starbucks", old_amount="520", old_currency="JPY", new_amount="500", new_currency="", new_store="", new_country="", new_category="")
+- "寫錯了 應該60HKD"
+  → Read last_saved_expense from state (e.g. store=的士, amount=30, currency=HKD) → modify_expense(old_store="的士", old_amount="30", old_currency="HKD", new_amount="60", new_currency="HKD", new_store="", new_country="", new_category="")
+
+**Routing summary:**
+- New expense (text) → **categorizer**
+- Receipt / image → **categorizer**
+- Search / list / delete → **expense_query**
+- Analysis / report / comparison → **expense_reporter**
+- Reimbursement summary / 請款 → **expense_reporter**
+- Cost-saving / break-even / 省錢 → **expense_reporter**
+- Modify / correct / change → **modify_expense** (YOU handle it directly)
 
 {LANGUAGE_INSTRUCTION}
 
-**When delegating to sub-agents:**
-- The sub-agents will read 'user_language' from session state automatically
-- You do NOT need to repeat the language choice in your delegation message
-
-**Rules:**
-1. Always delegate to the appropriate sub-agent — don't try to answer expense questions yourself
-2. For multi-step requests, delegate sequentially and combine the results
-3. If unclear which agent to use, ask the user to clarify
-4. Be concise in your own responses — let the sub-agents do the detailed work
-5. After the categorizer saves an expense, confirm to the user that it was saved
-6. For delete requests, ALWAYS route to expense_query — it will handle the confirmation flow
-7. For "total spending" or "how much total" questions across countries, ALWAYS route to expense_reporter — it handles cross-currency summaries and conversion when a target currency is requested
+**Delegation notes:**
+- Sub-agents read 'user_language' from session state automatically
+- For multi-step requests, delegate sequentially and combine results
+- After modify_expense returns, report the result to the user naturally (e.g. "已更新：Starbucks ¥520 → ¥500")
 """,
+    tools=[set_language_tool, modify_expense_tool],
     sub_agents=[expense_categorizer, expense_query, expense_reporter],
     after_model_callback=language_callback,
 )
