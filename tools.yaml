@@ -1,0 +1,102 @@
+sources:
+  expense-bq:
+    kind: bigquery
+    project: your-gcp-project-id
+
+tools:
+  query_expenses:
+    kind: bigquery-sql
+    source: expense-bq
+    description: "Query APAC household expense records. Returns expenses filtered by country, category, store name, and/or date range."
+    statement: |
+      SELECT id, date, country, category, amount, currency, store, subcategory, notes FROM `your-gcp-project-id.expense_data.expenses`
+      WHERE (@country = '' OR country = @country)
+      AND (@category = '' OR category = @category)
+      AND (@store = '' OR LOWER(store) LIKE CONCAT('%', LOWER(@store), '%'))
+      AND (@date_from = '' OR date >= CAST(@date_from AS DATE))
+      AND (@date_to = '' OR date <= CAST(@date_to AS DATE))
+      ORDER BY date DESC
+      LIMIT 50
+    parameters:
+      - name: country
+        type: string
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.). Empty string for all countries."
+      - name: category
+        type: string
+        description: "Expense category in Japanese: 食費, 交通, 日用品, 子供関連, サブスク, 住居・光熱費, 医療, 娯楽, 衣服・美容, その他. Empty string for all."
+      - name: store
+        type: string
+        description: "Store or service name to search for (partial match, case-insensitive). E.g., 'Starbucks', '翠華', 'セブン'. Empty string for all stores."
+      - name: date_from
+        type: string
+        description: "Start date in YYYY-MM-DD format (e.g., '2026-03-01'). Empty string for no lower bound."
+      - name: date_to
+        type: string
+        description: "End date in YYYY-MM-DD format (e.g., '2026-03-31'). Empty string for no upper bound."
+
+  get_spending_summary:
+    kind: bigquery-sql
+    source: expense-bq
+    description: "Get total spending grouped by country and category. Supports date range filtering."
+    statement: |
+      SELECT country, category, currency, COUNT(*) as count, ROUND(SUM(amount), 2) as total
+      FROM `your-gcp-project-id.expense_data.expenses`
+      WHERE (@country = '' OR country = @country)
+      AND (@date_from = '' OR date >= CAST(@date_from AS DATE))
+      AND (@date_to = '' OR date <= CAST(@date_to AS DATE))
+      GROUP BY country, category, currency
+      ORDER BY country, total DESC
+    parameters:
+      - name: country
+        type: string
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.). Empty string for all."
+      - name: date_from
+        type: string
+        description: "Start date in YYYY-MM-DD format (e.g., '2026-03-01'). Empty string for no lower bound."
+      - name: date_to
+        type: string
+        description: "End date in YYYY-MM-DD format (e.g., '2026-03-31'). Empty string for no upper bound."
+
+  save_expense:
+    kind: bigquery-sql
+    source: expense-bq
+    description: "Save a new categorized expense record to BigQuery. Used after categorizing a free-text expense."
+    statement: |
+      INSERT INTO `your-gcp-project-id.expense_data.expenses`
+      (id, date, country, category, amount, currency, store, subcategory, notes)
+      VALUES
+      (GENERATE_UUID(), CURRENT_DATE('Asia/Tokyo'), @country, @category, CAST(@amount AS FLOAT64), @currency, @store, @subcategory, @notes)
+    parameters:
+      - name: country
+        type: string
+        description: "2-letter country code (e.g., JP, HK, SG, TW, TH, KR, MY, AU, IN, PH, VN, ZA, US, GB, etc.)"
+      - name: category
+        type: string
+        description: "Expense category in Japanese: 食費, 交通, 日用品, 子供関連, サブスク, 住居・光熱費, 医療, 娯楽, 衣服・美容, その他"
+      - name: amount
+        type: string
+        description: "Expense amount as a string (e.g., '550', '85.5'). Use '0' if unknown."
+      - name: currency
+        type: string
+        description: "Currency code: JPY, HKD, SGD, TWD, THB, KRW, MYR, AUD, INR, PHP, USD"
+      - name: store
+        type: string
+        description: "Store or service name (e.g., Starbucks, 翠華餐廳, セブンイレブン)"
+      - name: subcategory
+        type: string
+        description: "More specific category (e.g., カフェ, 電車, hawker, grab)"
+      - name: notes
+        type: string
+        description: "Additional notes about the expense"
+
+  delete_expense:
+    kind: bigquery-sql
+    source: expense-bq
+    description: "Delete an expense record from BigQuery by its unique ID. Always query first to get the record ID, show details to user, and confirm before deleting."
+    statement: |
+      DELETE FROM `your-gcp-project-id.expense_data.expenses`
+      WHERE id = @id
+    parameters:
+      - name: id
+        type: string
+        description: "The unique ID (UUID) of the expense record to delete. Get this from query_expenses results first."

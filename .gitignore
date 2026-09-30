@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+*.env
+
+# Credentials / secrets
+service-account*.json
+*credentials*
+*secret*
+
+# Logs
+*.log
+
+# Snapshots (historical versions, not needed in repo)
+snapshots/
+
+# Withheld prompts must never be committed
+apac_expense_manager/prompts/*.md
+!apac_expense_manager/prompts/README.md
